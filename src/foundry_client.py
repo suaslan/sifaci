@@ -7,10 +7,14 @@ import threading
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from config import APP_NAME, FOUNDRY_MODEL_ALIAS
-
-
-TEST_PROMPT = "Merhaba. Sadece 'model çalışıyor' yaz."
+from config import (
+    CHAT_MAX_TOKENS,
+    CHAT_TEMPERATURE,
+    FOUNDRY_MODEL_ALIAS,
+    FOUNDRY_PREPARE_EXECUTION_PROVIDERS,
+    FOUNDRY_TEST_PROMPT,
+)
+from src.foundry_runtime import FoundryRuntimeError, get_foundry_manager
 
 
 class FoundryLocalError(RuntimeError):
@@ -23,22 +27,13 @@ _chat_model: Any | None = None
 _chat_client: Any | None = None
 
 
-def _load_sdk() -> tuple[Any, Any]:
-    try:
-        from foundry_local_sdk import Configuration, FoundryLocalManager
-    except (ImportError, OSError) as error:
-        raise FoundryLocalError(
-            "Foundry Local Python SDK yüklenemedi. Önce "
-            "'python -m pip install -r requirements.txt' komutunu çalıştırın."
-        ) from error
-    return Configuration, FoundryLocalManager
-
-
 def _show_model_download_progress(progress: float) -> None:
     print(f"\rModel indiriliyor: %{progress:.1f}", end="", flush=True)
 
 
 def _prepare_execution_providers(manager: Any) -> None:
+    if not FOUNDRY_PREPARE_EXECUTION_PROVIDERS:
+        return
     current_provider = ""
 
     def show_progress(provider_name: str, progress: float) -> None:
@@ -66,17 +61,9 @@ def _get_chat_client() -> Any:
         if _chat_client is not None:
             return _chat_client
 
-        Configuration, FoundryLocalManager = _load_sdk()
         model = None
         try:
-            try:
-                manager = FoundryLocalManager.instance
-            except Exception:
-                manager = None
-            if manager is None:
-                FoundryLocalManager.initialize(Configuration(app_name=APP_NAME))
-                manager = FoundryLocalManager.instance
-
+            manager = get_foundry_manager()
             _prepare_execution_providers(manager)
             model = manager.catalog.get_model(FOUNDRY_MODEL_ALIAS)
             if model is None:
@@ -93,8 +80,12 @@ def _get_chat_client() -> Any:
                 raise FoundryLocalError(
                     f"'{FOUNDRY_MODEL_ALIAS}' bir chat istemcisi oluşturmadı."
                 )
+            client.settings.temperature = CHAT_TEMPERATURE
+            client.settings.max_tokens = CHAT_MAX_TOKENS
         except FoundryLocalError:
             raise
+        except FoundryRuntimeError as error:
+            raise FoundryLocalError(str(error)) from error
         except Exception as error:
             if model is not None:
                 try:
@@ -162,7 +153,7 @@ def close_chat_model() -> None:
 def test_model() -> str:
     """Send a small smoke-test prompt to the configured local chat model."""
 
-    answer = complete_chat([{"role": "user", "content": TEST_PROMPT}])
+    answer = complete_chat([{"role": "user", "content": FOUNDRY_TEST_PROMPT}])
     print(f"Model cevabı: {answer}")
     return answer
 

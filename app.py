@@ -5,13 +5,21 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from config import DEBUG, EMBEDDING_MODEL_NAME, FOUNDRY_MODEL_ALIAS
+from config import (
+    APP_DESCRIPTION,
+    APP_TITLE,
+    DEBUG,
+    EMBEDDING_MODEL_NAME,
+    FOUNDRY_MODEL_ALIAS,
+    MAX_QUESTION_CHARS,
+    SOURCE_SECTION_MARKER,
+)
 from src.database import get_database_stats, initialize_database
 from src.rag import DISCLAIMER, answer_query
 
 
 LOGGER = logging.getLogger(__name__)
-SOURCE_MARKER = "\n\nKaynaklar: "
+SOURCE_MARKER = SOURCE_SECTION_MARKER
 
 
 def split_rag_response(response: str) -> tuple[str, str, str]:
@@ -118,7 +126,7 @@ def main() -> None:
     import streamlit as st
 
     st.set_page_config(
-        page_title="Yerel İlaç Bilgi Asistanı",
+        page_title=APP_TITLE,
         page_icon="💊",
         layout="centered",
         initial_sidebar_state="expanded",
@@ -137,8 +145,8 @@ def main() -> None:
 
     _render_sidebar(st)
 
-    st.title("Yerel İlaç Bilgi Asistanı")
-    st.caption("İlaçlar hakkında kayıtlı kaynaklardan bilgi alın.")
+    st.title(APP_TITLE)
+    st.caption(APP_DESCRIPTION)
     st.info(
         "Bu sistem yalnızca kayıtlı ürün bilgilerini görüntüler; kişisel reçete "
         "veya tedavi önerisi vermez. Acil bir durumda sağlık hizmetine başvurun."
@@ -161,7 +169,7 @@ def main() -> None:
 
     user_question = st.chat_input(
         "Bir ilaç hakkında sorunuzu yazın...",
-        max_chars=1_000,
+        max_chars=MAX_QUESTION_CHARS,
     )
     if not user_question:
         return

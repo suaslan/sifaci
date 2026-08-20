@@ -8,7 +8,8 @@ import threading
 from collections.abc import Sequence
 from typing import Any
 
-from config import APP_NAME, EMBEDDING_MODEL_NAME
+from config import EMBEDDING_MODEL_NAME
+from src.foundry_runtime import FoundryRuntimeError, get_foundry_manager
 
 
 class EmbeddingError(RuntimeError):
@@ -19,17 +20,6 @@ _load_lock = threading.Lock()
 _inference_lock = threading.Lock()
 _model: Any | None = None
 _embedding_client: Any | None = None
-
-
-def _load_sdk() -> tuple[Any, Any]:
-    try:
-        from foundry_local_sdk import Configuration, FoundryLocalManager
-    except (ImportError, OSError) as error:
-        raise EmbeddingError(
-            "Foundry Local Python SDK yüklenemedi. Önce "
-            "'python -m pip install -r requirements.txt' komutunu çalıştırın."
-        ) from error
-    return Configuration, FoundryLocalManager
 
 
 def _get_embedding_client() -> Any:
@@ -43,18 +33,9 @@ def _get_embedding_client() -> Any:
         if _embedding_client is not None:
             return _embedding_client
 
-        Configuration, FoundryLocalManager = _load_sdk()
         model = None
         try:
-            # Reuse an SDK manager initialized elsewhere in the application.
-            try:
-                manager = FoundryLocalManager.instance
-            except Exception:
-                manager = None
-            if manager is None:
-                FoundryLocalManager.initialize(Configuration(app_name=APP_NAME))
-                manager = FoundryLocalManager.instance
-
+            manager = get_foundry_manager()
             model = manager.catalog.get_model(EMBEDDING_MODEL_NAME)
             if model is None:
                 raise EmbeddingError(
@@ -71,6 +52,8 @@ def _get_embedding_client() -> Any:
                 )
         except EmbeddingError:
             raise
+        except FoundryRuntimeError as error:
+            raise EmbeddingError(str(error)) from error
         except Exception as error:
             if model is not None:
                 try:
@@ -105,6 +88,8 @@ def generate_embedding(text: str) -> list[float]:
 def generate_embeddings(texts: Sequence[str]) -> list[list[float]]:
     """Return embeddings for ``texts`` in the same order using one batch call."""
 
+    if isinstance(texts, (str, bytes, bytearray)):
+        raise TypeError("texts must be a sequence of strings, not one string")
     clean_texts = [_validate_text(text, index=index) for index, text in enumerate(texts)]
     if not clean_texts:
         return []

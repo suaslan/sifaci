@@ -10,12 +10,13 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from numbers import Real
 from pathlib import Path
 from typing import Any
 
-from config import DATABASE_PATH
+from config import DATABASE_PATH, EMBEDDING_MODEL_NAME
 
 
 MEDICINE_FIELDS = (
@@ -44,11 +45,23 @@ def _database_path(database_path: str | Path | None = None) -> Path:
     return path
 
 
-def _connect(database_path: str | Path | None = None) -> sqlite3.Connection:
+@contextmanager
+def _connect(
+    database_path: str | Path | None = None,
+) -> Iterator[sqlite3.Connection]:
+    """Yield a transactional SQLite connection and always close it."""
+
     connection = sqlite3.connect(_database_path(database_path))
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def initialize_database(database_path: str | Path | None = None) -> None:
@@ -82,6 +95,7 @@ def initialize_database(database_path: str | Path | None = None) -> None:
                 chunk_text TEXT NOT NULL,
                 chunk_type TEXT NOT NULL,
                 embedding TEXT,
+                embedding_model TEXT,
                 FOREIGN KEY (medicine_id)
                     REFERENCES medicines (medicine_id)
                     ON DELETE CASCADE
@@ -95,6 +109,14 @@ def initialize_database(database_path: str | Path | None = None) -> None:
                 ON document_chunks (chunk_type);
             """
         )
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(document_chunks)")
+        }
+        if "embedding_model" not in columns:
+            connection.execute(
+                "ALTER TABLE document_chunks ADD COLUMN embedding_model TEXT"
+            )
 
 
 def insert_medicine(
@@ -174,6 +196,7 @@ def insert_chunk(
     chunk_text: str,
     chunk_type: str,
     embedding: Sequence[float] | str | None = None,
+    embedding_model: str | None = None,
     *,
     database_path: str | Path | None = None,
 ) -> int:
@@ -187,15 +210,26 @@ def insert_chunk(
         raise ValueError("chunk_type is required")
 
     serialized_embedding = _serialize_embedding(embedding)
+    serialized_model = (
+        _to_optional_text(embedding_model) or EMBEDDING_MODEL_NAME
+        if serialized_embedding is not None
+        else None
+    )
     initialize_database(database_path)
     with _connect(database_path) as connection:
         cursor = connection.execute(
             """
             INSERT INTO document_chunks
-                (medicine_id, chunk_text, chunk_type, embedding)
-            VALUES (?, ?, ?, ?)
+                (medicine_id, chunk_text, chunk_type, embedding, embedding_model)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (medicine_id, clean_text, clean_type, serialized_embedding),
+            (
+                medicine_id,
+                clean_text,
+                clean_type,
+                serialized_embedding,
+                serialized_model,
+            ),
         )
         return int(cursor.lastrowid)
 
@@ -208,18 +242,26 @@ def replace_chunks(
 ) -> list[int]:
     """Atomically replace all chunks belonging to one medicine."""
 
-    prepared: list[tuple[int, str, str, str | None]] = []
+    prepared: list[tuple[int, str, str, str | None, str | None]] = []
     for chunk in chunks:
         chunk_text = str(chunk.get("chunk_text") or "").strip()
         chunk_type = str(chunk.get("chunk_type") or "").strip()
         if not chunk_text or not chunk_type:
             raise ValueError("Each chunk requires chunk_text and chunk_type")
+        serialized_embedding = _serialize_embedding(chunk.get("embedding"))
+        embedding_model = (
+            _to_optional_text(chunk.get("embedding_model"))
+            or EMBEDDING_MODEL_NAME
+            if serialized_embedding is not None
+            else None
+        )
         prepared.append(
             (
                 medicine_id,
                 chunk_text,
                 chunk_type,
-                _serialize_embedding(chunk.get("embedding")),
+                serialized_embedding,
+                embedding_model,
             )
         )
 
@@ -233,8 +275,8 @@ def replace_chunks(
             cursor = connection.execute(
                 """
                 INSERT INTO document_chunks
-                    (medicine_id, chunk_text, chunk_type, embedding)
-                VALUES (?, ?, ?, ?)
+                    (medicine_id, chunk_text, chunk_type, embedding, embedding_model)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 values,
             )
@@ -264,7 +306,8 @@ def get_chunks(
     where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     query = (
         "SELECT dc.chunk_id, dc.medicine_id, dc.chunk_text, dc.chunk_type, "
-        "dc.embedding, m.medicine_name, m.source_name, m.source_reference "
+        "dc.embedding, dc.embedding_model, m.medicine_name, m.source_name, "
+        "m.source_reference "
         "FROM document_chunks AS dc "
         "JOIN medicines AS m ON m.medicine_id = dc.medicine_id"
         f"{where_clause} ORDER BY dc.chunk_id"
@@ -368,4 +411,21 @@ def _serialize_embedding(embedding: Sequence[float] | str | None) -> str | None:
 
 
 def _deserialize_embedding(value: str | None) -> list[float] | None:
-    return json.loads(value) if value is not None else None
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+        if (
+            not isinstance(parsed, list)
+            or not parsed
+            or not all(
+                isinstance(item, Real)
+                and not isinstance(item, bool)
+                and math.isfinite(float(item))
+                for item in parsed
+            )
+        ):
+            return None
+        return [float(item) for item in parsed]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None

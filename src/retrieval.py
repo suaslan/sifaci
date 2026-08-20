@@ -9,12 +9,17 @@ from collections.abc import Callable, MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from config import DATABASE_PATH, MINIMUM_SIMILARITY_SCORE
+from config import (
+    DATABASE_PATH,
+    EMBEDDING_MODEL_NAME,
+    MEDICINE_NAME_BOOST,
+    MINIMUM_SIMILARITY_SCORE,
+    RETRIEVAL_TOP_K,
+)
 from src.database import get_chunks
 from src.embeddings import generate_embedding
 
 
-MEDICINE_NAME_BOOST = 0.12
 _GENERIC_NAME_WORDS = {
     "ampul",
     "film",
@@ -32,7 +37,7 @@ _GENERIC_NAME_WORDS = {
 
 def get_top_chunks(
     query: str,
-    top_k: int = 5,
+    top_k: int = RETRIEVAL_TOP_K,
     *,
     database_path: str | Path = DATABASE_PATH,
     embedding_function: Callable[[str], Sequence[float]] | None = None,
@@ -62,9 +67,29 @@ def get_top_chunks(
                 "minimum_similarity_score": minimum_score,
                 "requested_top_k": top_k,
                 "database_chunk_count": 0,
+                "stale_embedding_count": 0,
                 "top_chunks": [],
             }
         )
+
+    database_chunks = get_chunks(database_path=database_path)
+    if debug_trace is not None:
+        debug_trace["database_chunk_count"] = len(database_chunks)
+
+    candidate_chunks = []
+    for chunk in database_chunks:
+        raw_embedding = chunk.get("embedding")
+        if raw_embedding is None:
+            continue
+        stored_model = chunk.get("embedding_model")
+        if stored_model and stored_model != EMBEDDING_MODEL_NAME:
+            if debug_trace is not None:
+                debug_trace["stale_embedding_count"] += 1
+            continue
+        candidate_chunks.append(chunk)
+
+    if not candidate_chunks:
+        return []
 
     embed = embedding_function or generate_embedding
     query_embedding = _validated_vector(embed(query.strip()), "query embedding")
@@ -75,14 +100,8 @@ def get_top_chunks(
     normalized_query = _normalize_for_match(query)
     ranked: list[tuple[float, float, dict[str, Any]]] = []
 
-    database_chunks = get_chunks(database_path=database_path)
-    if debug_trace is not None:
-        debug_trace["database_chunk_count"] = len(database_chunks)
-
-    for chunk in database_chunks:
-        raw_embedding = chunk.get("embedding")
-        if raw_embedding is None:
-            continue
+    for chunk in candidate_chunks:
+        raw_embedding = chunk["embedding"]
         try:
             chunk_embedding = _validated_vector(raw_embedding, "chunk embedding")
             similarity = cosine_similarity(query_embedding, chunk_embedding)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from config import EMBEDDING_MODEL_NAME
 from src.database import (
     get_database_stats,
     get_chunks,
@@ -41,6 +42,7 @@ def test_database_round_trip_and_parameterized_values(tmp_path):
     assert medicine is not None
     assert medicine["medicine_id"] == medicine_id
     assert chunks[0]["embedding"] == [0.1, -0.2, 0.3]
+    assert chunks[0]["embedding_model"] == EMBEDDING_MODEL_NAME
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM medicines").fetchone()[0] == 1
 
@@ -71,6 +73,42 @@ def test_ingestion_is_idempotent_and_creates_typed_chunks(tmp_path):
         "dosage",
         "side_effects",
     }
+
+
+def test_ingestion_refreshes_vectors_when_embedding_model_changes(tmp_path):
+    database_path = tmp_path / "medicines.db"
+    record = {
+        "medicine_name": "Model değişim ilacı",
+        "warnings": "Kayıtlı uyarı metni.",
+    }
+    calls: list[str] = []
+
+    def embed(text: str):
+        calls.append(text)
+        return [1.0, 0.0]
+
+    ingest_medicine_record(
+        record,
+        database_path=database_path,
+        embedding_function=embed,
+        embedding_model_name="model-a",
+    )
+    ingest_medicine_record(
+        record,
+        database_path=database_path,
+        embedding_function=embed,
+        embedding_model_name="model-a",
+    )
+    ingest_medicine_record(
+        record,
+        database_path=database_path,
+        embedding_function=embed,
+        embedding_model_name="model-b",
+    )
+
+    chunks = get_chunks(database_path=database_path)
+    assert len(calls) == 2
+    assert chunks[0]["embedding_model"] == "model-b"
 
 
 def test_reimport_without_source_reuses_the_record(tmp_path):
@@ -119,3 +157,20 @@ def test_database_stats(tmp_path):
         "medicine_count": 1,
         "chunk_count": 1,
     }
+
+
+def test_database_connections_are_closed_after_operations(tmp_path):
+    database_path = tmp_path / "closable.db"
+    medicine_id = insert_medicine("Kapanan bağlantı", database_path=database_path)
+    insert_chunk(
+        medicine_id,
+        "Bağlantı testi",
+        "usage",
+        [1.0, 0.0],
+        database_path=database_path,
+    )
+    get_chunks(database_path=database_path)
+    get_database_stats(database_path)
+
+    database_path.unlink()
+    assert not database_path.exists()

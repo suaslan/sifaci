@@ -7,25 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from config import DATABASE_PATH
+from src.database import MEDICINE_FIELDS
 from src.ingestion import ingest_medicine_record
 
 
-ADMIN_MEDICINE_FIELDS = (
-    "medicine_name",
-    "active_ingredient",
-    "indications",
-    "usage_information",
-    "dosage_information",
-    "frequency_information",
-    "route_of_administration",
-    "common_side_effects",
-    "serious_side_effects",
-    "warnings",
-    "contraindications",
-    "interactions",
-    "source_name",
-    "source_reference",
-)
+ADMIN_MEDICINE_FIELDS = MEDICINE_FIELDS
 
 
 def validate_medicine_form(values: Mapping[str, Any]) -> dict[str, str | None]:
