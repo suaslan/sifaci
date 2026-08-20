@@ -49,3 +49,8 @@ def test_generate_embeddings_does_not_load_model_for_empty_input(monkeypatch):
 def test_empty_text_is_rejected():
     with pytest.raises(ValueError, match="cannot be empty"):
         embeddings.generate_embedding("  ")
+
+
+def test_batch_rejects_one_string():
+    with pytest.raises(TypeError, match="sequence of strings"):
+        embeddings.generate_embeddings("tek metin")

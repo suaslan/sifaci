@@ -1,19 +1,28 @@
-"""Şifacı uygulamasının basit geliştirme giriş noktası.
+"""Terminal status entry point for the Şifacı application."""
 
-RAG akisinin parcalari sonraki asamalarda ``src`` modullerinden cagrilacak.
-Bu ilk surum yalnizca proje ayarlarinin okunabildigini gosterir.
-"""
-
-from config import APP_NAME, DATABASE_PATH, FOUNDRY_MODEL_ALIAS
+from config import (
+    APP_TITLE,
+    DATABASE_PATH,
+    EMBEDDING_MODEL_NAME,
+    FOUNDRY_MODEL_ALIAS,
+    MEDICINE_DOCUMENTS_DIR,
+)
+from src.database import get_database_stats, initialize_database
 
 
 def main() -> None:
-    """Baslangic bilgilerini terminale yazdir."""
+    """Initialize SQLite and print the current local configuration."""
 
-    print(f"{APP_NAME} - Yerel İlaç Bilgi Asistanı")
-    print(f"Veritabani: {DATABASE_PATH}")
-    print(f"Foundry Local modeli: {FOUNDRY_MODEL_ALIAS}")
-    print("RAG islevleri sonraki asamalarda eklenecek.")
+    initialize_database()
+    stats = get_database_stats()
+    print(APP_TITLE)
+    print(f"JSON klasörü: {MEDICINE_DOCUMENTS_DIR}")
+    print(f"Veritabanı: {DATABASE_PATH}")
+    print(f"İlaç / chunk: {stats['medicine_count']} / {stats['chunk_count']}")
+    print(f"Foundry Local chat modeli: {FOUNDRY_MODEL_ALIAS}")
+    print(f"Foundry Local embedding modeli: {EMBEDDING_MODEL_NAME}")
+    print("JSON aktarımı: python -m src.ingestion")
+    print("Arayüz: streamlit run app.py")
 
 
 if __name__ == "__main__":

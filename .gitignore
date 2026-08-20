@@ -16,6 +16,8 @@ env/
 .env.*
 
 data/*.db
+data/*.db-shm
+data/*.db-wal
 data/*.sqlite
 data/*.sqlite3
 

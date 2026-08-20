@@ -75,6 +75,22 @@ def test_get_top_chunks_returns_empty_below_threshold(monkeypatch):
     )
 
 
+def test_empty_database_does_not_generate_query_embedding(monkeypatch):
+    monkeypatch.setattr(retrieval, "get_chunks", lambda **_: [])
+
+    def fail_embedding(_text):
+        raise AssertionError("embedding model should not load for an empty database")
+
+    trace = {}
+    assert retrieval.get_top_chunks(
+        "herhangi bir soru",
+        embedding_function=fail_embedding,
+        debug_trace=trace,
+    ) == []
+    assert trace["query_embedding_created"] is False
+    assert trace["database_chunk_count"] == 0
+
+
 def test_debug_trace_contains_embedding_and_ranked_chunks(monkeypatch):
     monkeypatch.setattr(
         retrieval,

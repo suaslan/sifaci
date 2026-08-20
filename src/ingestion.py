@@ -9,16 +9,20 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from config import DATABASE_PATH, MEDICINE_DOCUMENTS_DIR
+from config import (
+    DATABASE_PATH,
+    EMBEDDING_MODEL_NAME,
+    MAX_CHUNK_CHARS,
+    MEDICINE_DOCUMENTS_DIR,
+)
 from src.database import (
+    MEDICINE_FIELDS,
     get_chunks,
     initialize_database,
     insert_medicine,
     replace_chunks,
 )
 
-
-DEFAULT_MAX_CHUNK_CHARS = 1_200
 
 # JSON input key -> (database field, chunk category)
 SECTION_FIELDS: dict[str, tuple[str, str]] = {
@@ -63,7 +67,7 @@ def load_medicine_file(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
-def split_text_safely(text: Any, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) -> list[str]:
+def split_text_safely(text: Any, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     """Split long text at paragraph or sentence boundaries, never mid-sentence.
 
     A single sentence longer than ``max_chars`` remains intact.  This is
@@ -122,22 +126,8 @@ def normalize_medicine(record: Mapping[str, Any]) -> dict[str, str | None]:
     if not name:
         raise ValueError("Each medicine record must contain medicine_name")
 
-    normalized: dict[str, str | None] = {
-        "medicine_name": name,
-        "active_ingredient": None,
-        "indications": None,
-        "usage_information": None,
-        "dosage_information": None,
-        "frequency_information": None,
-        "route_of_administration": None,
-        "common_side_effects": None,
-        "serious_side_effects": None,
-        "warnings": None,
-        "contraindications": None,
-        "interactions": None,
-        "source_name": None,
-        "source_reference": None,
-    }
+    normalized: dict[str, str | None] = {field: None for field in MEDICINE_FIELDS}
+    normalized["medicine_name"] = name
 
     for input_field, (database_field, _) in SECTION_FIELDS.items():
         value = _as_text(record.get(input_field))
@@ -167,7 +157,7 @@ def normalize_medicine(record: Mapping[str, Any]) -> dict[str, str | None]:
 def create_chunks(
     record: Mapping[str, Any],
     *,
-    max_chars: int = DEFAULT_MAX_CHUNK_CHARS,
+    max_chars: int = MAX_CHUNK_CHARS,
 ) -> list[dict[str, str]]:
     """Convert meaningful medicine sections into typed text chunks."""
 
@@ -201,7 +191,8 @@ def ingest_medicine_record(
     record: Mapping[str, Any],
     *,
     database_path: str | Path = DATABASE_PATH,
-    max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
+    max_chunk_chars: int = MAX_CHUNK_CHARS,
+    embedding_model_name: str = EMBEDDING_MODEL_NAME,
     embedding_function: Callable[[str], Sequence[float]] | None = None,
 ) -> tuple[int, int]:
     """Insert one medicine and its chunks; return ``(medicine_id, count)``."""
@@ -211,7 +202,7 @@ def ingest_medicine_record(
     chunks = create_chunks(record, max_chars=max_chunk_chars)
 
     existing_chunks = get_chunks(medicine_id, database_path=database_path)
-    if _chunks_are_current(existing_chunks, chunks):
+    if _chunks_are_current(existing_chunks, chunks, embedding_model_name):
         return medicine_id, len(chunks)
 
     chunk_texts = [chunk["chunk_text"] for chunk in chunks]
@@ -227,7 +218,11 @@ def ingest_medicine_record(
     if len(embeddings) != len(chunks):
         raise ValueError("Embedding count does not match the document chunk count")
     chunks_with_embeddings = [
-        {**chunk, "embedding": embedding}
+        {
+            **chunk,
+            "embedding": embedding,
+            "embedding_model": embedding_model_name,
+        }
         for chunk, embedding in zip(chunks, embeddings, strict=True)
     ]
     replace_chunks(
@@ -242,7 +237,8 @@ def ingest_directory(
     directory: str | Path = MEDICINE_DOCUMENTS_DIR,
     *,
     database_path: str | Path = DATABASE_PATH,
-    max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
+    max_chunk_chars: int = MAX_CHUNK_CHARS,
+    embedding_model_name: str = EMBEDDING_MODEL_NAME,
     embedding_function: Callable[[str], Sequence[float]] | None = None,
 ) -> dict[str, int]:
     """Import every JSON file and return ingestion counters."""
@@ -260,6 +256,7 @@ def ingest_directory(
                 database_path=database_path,
                 max_chunk_chars=max_chunk_chars,
                 embedding_function=embedding_function,
+                embedding_model_name=embedding_model_name,
             )
             stats["medicines"] += 1
             stats["chunks"] += chunk_count
@@ -269,6 +266,7 @@ def ingest_directory(
 def _chunks_are_current(
     existing_chunks: Sequence[Mapping[str, Any]],
     new_chunks: Sequence[Mapping[str, Any]],
+    embedding_model_name: str,
 ) -> bool:
     """Return true when unchanged chunks already have stored embeddings."""
 
@@ -278,6 +276,7 @@ def _chunks_are_current(
         existing.get("chunk_text") == new.get("chunk_text")
         and existing.get("chunk_type") == new.get("chunk_type")
         and bool(existing.get("embedding"))
+        and existing.get("embedding_model") == embedding_model_name
         for existing, new in zip(existing_chunks, new_chunks, strict=True)
     )
 
@@ -298,7 +297,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="JSON ilaç kayıtlarını SQLite'a aktarır.")
     parser.add_argument("--directory", type=Path, default=MEDICINE_DOCUMENTS_DIR)
     parser.add_argument("--database", type=Path, default=DATABASE_PATH)
-    parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHUNK_CHARS)
+    parser.add_argument("--max-chars", type=int, default=MAX_CHUNK_CHARS)
     args = parser.parse_args()
 
     result = ingest_directory(

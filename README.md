@@ -1,89 +1,122 @@
 # Şifacı
 
-Bu proje, yalnizca kullanicinin sisteme ekledigi ilac belgelerinden cevap
-uretecek yerel bir RAG uygulamasinin baslangic iskeletidir. Bir receteleme
-sistemi degildir.
+Şifacı, kullanıcının eklediği ilaç belgelerini yerel olarak indeksleyen ve
+yalnızca bu kayıtları kaynak göstererek cevap veren bir Streamlit RAG
+uygulamasıdır. Kişisel reçete, tanı, doz hesabı veya tedavi önerisi vermez.
 
-## Proje yapisi
+## Veri akışı
 
 ```text
-şifacı/
-|-- app.py
-|-- main.py
-|-- config.py
-|-- requirements.txt
-|-- README.md
-|-- data/
-|   |-- medicines/
-|   `-- medicines.db
-|-- src/
-|   |-- __init__.py
-|   |-- database.py
-|   |-- embeddings.py
-|   |-- ingestion.py
-|   |-- retrieval.py
-|   |-- rag.py
-|   `-- foundry_client.py
-`-- tests/
+data/medicines/*.json
+  -> src.ingestion (doğrulama ve güvenli chunking)
+  -> Microsoft Foundry Local embedding modeli
+  -> SQLite medicines + document_chunks
+  -> soru embedding'i + cosine similarity
+  -> en alakalı chunk'lar
+  -> güvenlik sınırlı RAG context
+  -> Microsoft Foundry Local chat modeli
+  -> Streamlit chat cevabı ve kaynak listesi
 ```
 
-## Dosyalarin gorevleri
+Embedding vektörleri SQLite içinde JSON dizileri olarak saklanır. Her chunk,
+üretildiği embedding modelinin adını da taşır; model ayarı değişirse ingestion
+eski vektörleri yeniden üretir. Aynı, değişmemiş belge tekrar işlendiğinde chunk
+kayıtları çoğaltılmaz.
 
-- `app.py`: Streamlit kullanici arayuzunun giris noktasi olacak.
-- `main.py`: Terminalden calistirma ve gelistirme kontrolleri icin basit giris
-  noktasi.
-- `config.py`: Dosya yollari, yerel model adlari, retrieval ayarlari ve guvenli
-  varsayilan cevap gibi ortak ayarlari tutar.
-- `requirements.txt`: Projenin Python kutuphanelerini listeler. `sqlite3`,
-  Python ile birlikte geldigi icin ayrica eklenmez.
-- `data/medicines/`: Sisteme yuklenecek kaynak ilac belgelerinin yeri.
-- `data/medicines.db`: Ilac metinleri ve embedding vektorleri icin kullanilacak
-  SQLite veritabani. Tablo semasi sonraki asamada olusturulacak.
-- `src/database.py`: SQLite baglantisi ve veri erisim islemleri.
-- `src/embeddings.py`: Yerel embedding modelinin yuklenmesi ve vektor uretimi.
-- `src/ingestion.py`: Belgelerin okunmasi, parcalanmasi ve veritabanina
-  aktarilmasi.
-- `src/retrieval.py`: Cosine similarity tabanli vektor aramasi.
-- `src/rag.py`: Retrieval, guvenli prompt ve cevap uretme akisinin birlestigi
-  modul.
-- `src/foundry_client.py`: Foundry Local SDK entegrasyonunun uygulamanin geri
-  kalanindan ayrildigi modul.
-- `tests/`: Otomatik testler bu klasore eklenecek.
+## Proje yapısı
 
-## Kurulum
+```text
+app.py                         Streamlit chat arayüzü
+pages/1_İlaç_Ekle.py           Yönetici ilaç ekleme formu
+config.py                      Tüm çalışma ayarları
+data/medicines/                Kullanıcı JSON belgeleri
+src/database.py                SQLite şeması ve veri erişimi
+src/ingestion.py               JSON okuma, chunking ve embedding
+src/embeddings.py              Foundry Local embedding istemcisi
+src/retrieval.py               Cosine similarity ve isim önceliği
+src/rag.py                     Güvenlik sınırlı retrieval-augmented cevap
+src/foundry_runtime.py         Paylaşılan Foundry Local SDK başlatma katmanı
+src/foundry_client.py          Foundry Local chat istemcisi
+tests/                         Birim, güvenlik ve uçtan uca akış testleri
+```
 
-Python 3.11 veya daha yeni bir surum kullanin.
+## JSON formatı
+
+`data/medicines/example_medicine.json` şablondur ve `"is_example": true`
+olduğu için ingestion sırasında atlanır. Kendi dosyanızda bu alanı kaldırın
+veya `false` yapın. Boş alanlar uydurulmaz; boş olarak saklanabilir.
+
+## Windows üzerinde sıfırdan kurulum
+
+PowerShell açın:
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
+git clone https://github.com/suaslan/sifaci.git
+cd sifaci
+
+py -3.12 -m venv .venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
-
-Basit giris dosyasini calistirmak icin:
-
-```powershell
+python -m pytest -q tests
 python main.py
 ```
 
-Foundry Local bağlantısını ve yerel modeli test etmek için:
+İlaç JSON dosyanızı hazırlayıp aktarın:
 
 ```powershell
-python -m src.foundry_client
+Copy-Item .\data\medicines\example_medicine.json .\data\medicines\my_medicine.json
+notepad .\data\medicines\my_medicine.json
+python -m src.ingestion
 ```
 
-İlk test sırasında seçilen model ve Windows ML yürütme sağlayıcısı indirilebilir.
-İndirme tamamlandıktan sonra prompt işleme cihazdaki Foundry Local çalışma zamanı
-üzerinde gerçekleşir. Kullanılan model adı yalnızca `config.py` dosyasındaki
-`FOUNDRY_MODEL_ALIAS` ayarından değiştirilir.
+Editörde örnek değerleri gerçek, doğrulanmış ürün bilgileriyle değiştirin ve
+`is_example` alanını kaldırın ya da `false` yapın.
 
-## Guvenlik sinirlari
+Foundry Local modellerini ayrı ayrı doğrulamak ve uygulamayı açmak için:
 
-Uygulama tamamlandiginda model yalnizca retrieval sonucunda bulunan kaynaklari
-kullanacak; doz, kullanim sikligi veya yan etki bilgisi uretmeyecek ya da tahmin
-etmeyecektir. Kaynaklarda cevap yoksa su sabit yanit verilecektir:
+```powershell
+python -c "from src.embeddings import generate_embedding; print('Embedding boyutu:', len(generate_embedding('deneme metni')))"
+python -m src.foundry_client
+python -m scripts.smoke_pipeline
+streamlit run app.py
+```
 
-> Bu bilgi mevcut ilac veri tabaninda bulunmuyor.
+İlk model çağrısında yürütme sağlayıcıları ve model dosyaları indirilebilir.
 
-Bu ilk asamada veritabani semasi, belge aktarimi, vektor aramasi, Foundry Local
-cagrisi ve Streamlit arayuzu bilerek uygulanmamistir.
+## Merkezi ayarlar
+
+Varsayılanlar `config.py` içindedir. Aşağıdaki ortam değişkenleri kodu
+değiştirmeden kullanılabilir:
+
+- `DEBUG=true`
+- `FOUNDRY_APP_NAME=sifaci`
+- `FOUNDRY_MODEL_ALIAS=qwen2.5-0.5b`
+- `EMBEDDING_MODEL_NAME=qwen3-embedding-0.6b`
+- `FOUNDRY_PREPARE_EXECUTION_PROVIDERS=true`
+- `CHAT_TEMPERATURE=0.0`
+- `CHAT_MAX_TOKENS=600`
+- `MAX_CHUNK_CHARS=1200`
+- `RETRIEVAL_TOP_K=5`
+- `MINIMUM_SIMILARITY_SCORE=0.35`
+- `MEDICINE_NAME_BOOST=0.12`
+- `MAX_QUESTION_CHARS=1000`
+
+Debug arayüzünü açmak için Streamlit'ten önce:
+
+```powershell
+$env:DEBUG = "true"
+streamlit run app.py
+```
+
+## Güvenlik sınırları
+
+- Model yalnızca retrieval context içindeki metni kullanmalıdır.
+- Kaynakta olmayan doz, sıklık, süre veya uygulama yolu oluşturulamaz.
+- Kişiye özel doz ve tedavi soruları backend tarafından model çağrısından önce
+  engellenir.
+- Ciddi yan etki kayıtları görünür güvenlik uyarısı üretir.
+- Düşük benzerlikte veya eksik bilgide sabit “bilgi bulunmuyor” cevabı verilir.
+- Her cevap kaynak adı ve kişisel tıbbi değerlendirme uyarısıyla tamamlanır.
