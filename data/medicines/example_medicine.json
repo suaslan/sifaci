@@ -1,0 +1,22 @@
+{
+  "is_example": true,
+  "medicine_name": "ÖRNEK İLAÇ 100 mg tablet",
+  "active_ingredient": "Örnek etkin madde",
+  "indications": "İlacın hangi durumlarda kullanıldığına ilişkin onaylı metni buraya yazın.",
+  "usage_information": "İlacın hastaya yönelik kullanım talimatını buraya yazın.",
+  "dosage_information": "Onaylı KÜB veya KT belgesindeki doz bilgisini değiştirmeden buraya yazın.",
+  "frequency_information": "Onaylı kullanım sıklığını buraya yazın.",
+  "route_of_administration": "Örneğin: Ağızdan kullanılır.",
+  "common_side_effects": [
+    "Yaygın yan etki örneği 1",
+    "Yaygın yan etki örneği 2"
+  ],
+  "serious_side_effects": "Acil değerlendirme gerektiren onaylı yan etki metnini buraya yazın.",
+  "warnings": "KÜB/KT belgesindeki uyarıları buraya yazın.",
+  "contraindications": "İlacın kullanılmaması gereken durumları buraya yazın.",
+  "interactions": "Diğer ilaçlar veya maddelerle etkileşimleri buraya yazın.",
+  "source": {
+    "name": "TİTCK KÜB/KT",
+    "reference": "Belgenin resmi URL'si, ürün numarası veya onay tarihi"
+  }
+}

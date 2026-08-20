@@ -1,0 +1,1 @@
+"""Şifacı uygulamasının modülleri."""
