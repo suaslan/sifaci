@@ -12,31 +12,13 @@ from config import (
     EMBEDDING_MODEL_NAME,
     FOUNDRY_MODEL_ALIAS,
     MAX_QUESTION_CHARS,
-    SOURCE_SECTION_MARKER,
 )
-from src.database import get_database_stats, initialize_database
+from src.database import get_database_stats, initialize_database, require_database_content
 from src.rag import DISCLAIMER, answer_query
+from src.response_format import split_rag_response
 
 
 LOGGER = logging.getLogger(__name__)
-SOURCE_MARKER = SOURCE_SECTION_MARKER
-
-
-def split_rag_response(response: str) -> tuple[str, str, str]:
-    """Split a RAG response into answer, source names, and safety disclaimer."""
-
-    if SOURCE_MARKER not in response:
-        return response.strip(), "Belirtilmemiş", DISCLAIMER
-
-    answer, source_section = response.rsplit(SOURCE_MARKER, maxsplit=1)
-    source_names, separator, disclaimer = source_section.partition("\n\n")
-    return (
-        answer.strip(),
-        source_names.strip() or "Belirtilmemiş",
-        disclaimer.strip() if separator and disclaimer.strip() else DISCLAIMER,
-    )
-
-
 def _render_assistant_message(st: Any, message: dict[str, Any]) -> None:
     with st.chat_message("assistant", avatar="💊"):
         st.markdown(message["content"])
@@ -132,6 +114,12 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     initialize_database()
+    try:
+        require_database_content()
+    except RuntimeError as error:
+        st.error(str(error))
+        st.code("python -m src.ingestion", language="powershell")
+        st.stop()
 
     st.markdown(
         """

@@ -4,12 +4,18 @@ import sqlite3
 
 from config import EMBEDDING_MODEL_NAME
 from src.database import (
+    get_data_coverage,
     get_database_stats,
+    get_document_diagnostics,
     get_chunks,
     get_medicine_by_name,
+    get_medicine_names,
     initialize_database,
     insert_chunk,
     insert_medicine,
+    replace_document_chunks,
+    require_database_content,
+    upsert_document,
 )
 from src.ingestion import create_chunks, ingest_medicine_record, split_text_safely
 
@@ -157,6 +163,23 @@ def test_database_stats(tmp_path):
         "medicine_count": 1,
         "chunk_count": 1,
     }
+    assert get_medicine_names(database_path=database_path) == ["İstatistik ilacı"]
+    assert require_database_content(database_path) == {
+        "medicine_count": 1,
+        "chunk_count": 1,
+    }
+
+
+def test_empty_database_fails_with_ingestion_instruction(tmp_path):
+    database_path = tmp_path / "empty.db"
+
+    try:
+        require_database_content(database_path)
+    except RuntimeError as error:
+        assert "python -m src.ingestion" in str(error)
+        assert str(database_path.resolve()) in str(error)
+    else:
+        raise AssertionError("Empty database must not be accepted")
 
 
 def test_database_connections_are_closed_after_operations(tmp_path):
@@ -174,3 +197,51 @@ def test_database_connections_are_closed_after_operations(tmp_path):
 
     database_path.unlink()
     assert not database_path.exists()
+
+
+def test_debug_diagnostics_and_coverage_percentages(tmp_path):
+    database_path = tmp_path / "diagnostics.db"
+    medicine_id = insert_medicine("Kapsanan ilaç", database_path=database_path)
+    insert_medicine("Eksik ilaç", database_path=database_path)
+    kt_id, _ = upsert_document(
+        medicine_id,
+        "KT",
+        "https://www.titck.gov.tr/kt.pdf",
+        database_path=database_path,
+    )
+    upsert_document(
+        medicine_id,
+        "KUB",
+        "https://www.titck.gov.tr/kub.pdf",
+        database_path=database_path,
+    )
+    replace_document_chunks(
+        kt_id,
+        medicine_id,
+        [
+            {
+                "chunk_text": "Kayıtlı yan etki.",
+                "chunk_type": "side_effects",
+                "embedding": [1.0, 0.0],
+                "embedding_model": EMBEDDING_MODEL_NAME,
+            }
+        ],
+        database_path=database_path,
+    )
+
+    documents = get_document_diagnostics([medicine_id], database_path=database_path)
+    coverage = get_data_coverage(missing_limit=5, database_path=database_path)
+
+    kt = next(item for item in documents if item["document_type"] == "KT")
+    assert kt["chunk_count"] == 1
+    assert kt["embedded_chunk_count"] == 1
+    assert kt["pending_embedding_count"] == 0
+    assert coverage["total_medicines"] == 2
+    assert coverage["total_documents"] == 2
+    assert coverage["total_chunks"] == 1
+    assert coverage["total_embedded_chunks"] == 1
+    assert coverage["documents_percentage"] == 50.0
+    assert coverage["kt_percentage"] == 50.0
+    assert coverage["kub_percentage"] == 50.0
+    assert coverage["chunks_percentage"] == 50.0
+    assert coverage["embeddings_percentage"] == 50.0

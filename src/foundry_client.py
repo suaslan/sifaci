@@ -11,10 +11,13 @@ from config import (
     CHAT_MAX_TOKENS,
     CHAT_TEMPERATURE,
     FOUNDRY_MODEL_ALIAS,
-    FOUNDRY_PREPARE_EXECUTION_PROVIDERS,
     FOUNDRY_TEST_PROMPT,
 )
-from src.foundry_runtime import FoundryRuntimeError, get_foundry_manager
+from src.foundry_runtime import (
+    FoundryRuntimeError,
+    get_foundry_manager,
+    prepare_execution_providers as _prepare_execution_providers,
+)
 
 
 class FoundryLocalError(RuntimeError):
@@ -29,25 +32,6 @@ _chat_client: Any | None = None
 
 def _show_model_download_progress(progress: float) -> None:
     print(f"\rModel indiriliyor: %{progress:.1f}", end="", flush=True)
-
-
-def _prepare_execution_providers(manager: Any) -> None:
-    if not FOUNDRY_PREPARE_EXECUTION_PROVIDERS:
-        return
-    current_provider = ""
-
-    def show_progress(provider_name: str, progress: float) -> None:
-        nonlocal current_provider
-        current_provider = provider_name
-        print(
-            f"\rYürütme sağlayıcısı hazırlanıyor: {provider_name} %{progress:.1f}",
-            end="",
-            flush=True,
-        )
-
-    manager.download_and_register_eps(progress_callback=show_progress)
-    if current_provider:
-        print()
 
 
 def _get_chat_client() -> Any:

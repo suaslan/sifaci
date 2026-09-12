@@ -226,11 +226,10 @@ def test_frequency_missing(scenario_database):
     answer = answer_query(
         scenario.input,
         retrieval_function=retrieval,
-        chat_function=_grounded_chat("Kategori: indications", MISSING_INFORMATION_RESPONSE),
+        chat_function=_chat_must_not_run,
     )
 
-    assert chunks[0]["medicine_name"] == "BETA 5 mg tablet"
-    assert all(chunk["chunk_type"] != "frequency" for chunk in chunks)
+    assert chunks == []
     assert answer.startswith(MISSING_INFORMATION_RESPONSE)
 
 

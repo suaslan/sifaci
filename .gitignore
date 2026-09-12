@@ -4,6 +4,7 @@ __pycache__/
 
 .pytest_cache/
 .pytest_tmp/
+.test_*/
 pytest-cache-files-*/
 .coverage
 htmlcov/
@@ -14,12 +15,16 @@ env/
 
 .env
 .env.*
+.runtime/
+kernel.errors.txt
 
 data/*.db
 data/*.db-shm
 data/*.db-wal
 data/*.sqlite
 data/*.sqlite3
+data/source/*.xlsx
+data/documents/**/*.pdf
 
 .idea/
 .vscode/

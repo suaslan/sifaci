@@ -5,11 +5,16 @@ from __future__ import annotations
 import atexit
 import math
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
-from config import EMBEDDING_MODEL_NAME
-from src.foundry_runtime import FoundryRuntimeError, get_foundry_manager
+from config import EMBEDDING_BATCH_SIZE, EMBEDDING_DEVICE_TYPE, EMBEDDING_MODEL_NAME
+from src.foundry_runtime import (
+    FoundryRuntimeError,
+    get_foundry_manager,
+    prepare_execution_providers,
+    select_model_variant,
+)
 
 
 class EmbeddingError(RuntimeError):
@@ -36,12 +41,16 @@ def _get_embedding_client() -> Any:
         model = None
         try:
             manager = get_foundry_manager()
+            if EMBEDDING_DEVICE_TYPE != "CPU":
+                prepare_execution_providers(manager)
             model = manager.catalog.get_model(EMBEDDING_MODEL_NAME)
             if model is None:
                 raise EmbeddingError(
                     f"'{EMBEDDING_MODEL_NAME}' embedding modeli Foundry Local "
                     "kataloğunda bulunamadı."
                 )
+
+            model = select_model_variant(model, EMBEDDING_DEVICE_TYPE)
 
             model.download()
             model.load()
@@ -70,6 +79,12 @@ def _get_embedding_client() -> Any:
         return client
 
 
+def load_embedding_model() -> None:
+    """Eagerly load the process-wide model and keep it resident in RAM."""
+
+    _get_embedding_client()
+
+
 def generate_embedding(text: str) -> list[float]:
     """Return one numerical embedding vector for non-empty ``text``."""
 
@@ -94,15 +109,55 @@ def generate_embeddings(texts: Sequence[str]) -> list[list[float]]:
     if not clean_texts:
         return []
 
-    client = _get_embedding_client()
+    return _generate_embeddings_with_client(_get_embedding_client(), clean_texts)
+
+
+def _generate_embeddings_with_client(
+    client: Any,
+    clean_texts: Sequence[str],
+) -> list[list[float]]:
+    """Run one batch against an already-loaded resident client."""
+
     try:
         with _inference_lock:
-            response = client.generate_embeddings(clean_texts)
+            response = client.generate_embeddings(list(clean_texts))
         return _extract_vectors(response, expected_count=len(clean_texts))
     except EmbeddingError:
         raise
     except Exception as error:
         raise EmbeddingError(f"Embedding grubu üretilemedi: {error}") from error
+
+
+def iter_embedding_batches(
+    texts: Sequence[str],
+    *,
+    batch_size: int = EMBEDDING_BATCH_SIZE,
+    embedding_function: Callable[[Sequence[str]], list[list[float]]] | None = None,
+) -> Iterator[tuple[int, list[list[float]]]]:
+    """Yield ordered 32/64-sized embedding batches from one resident model."""
+
+    if batch_size not in {32, 64}:
+        raise ValueError("batch_size must be 32 or 64")
+    if isinstance(texts, (str, bytes, bytearray)):
+        raise TypeError("texts must be a sequence of strings, not one string")
+    clean_texts = [_validate_text(text, index=index) for index, text in enumerate(texts)]
+    if not clean_texts:
+        return
+
+    batch_embedder = embedding_function
+    if batch_embedder is None:
+        client = _get_embedding_client()
+        batch_embedder = lambda batch: _generate_embeddings_with_client(client, batch)
+
+    for offset in range(0, len(clean_texts), batch_size):
+        batch = clean_texts[offset : offset + batch_size]
+        vectors = batch_embedder(batch)
+        if len(vectors) != len(batch):
+            raise EmbeddingError(
+                "Embedding batch boyutu girdiyle uyuşmuyor: "
+                f"beklenen={len(batch)}, alınan={len(vectors)}"
+            )
+        yield offset, vectors
 
 
 def close_embedding_model() -> None:

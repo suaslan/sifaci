@@ -28,6 +28,18 @@ def test_get_top_chunks_orders_and_returns_required_fields(monkeypatch):
         },
     ]
     monkeypatch.setattr(retrieval, "get_chunks", lambda **_: chunks)
+    monkeypatch.setattr(
+        retrieval,
+        "find_candidate_medicines",
+        lambda *_, **__: [
+            {
+                "medicine_id": 1,
+                "medicine_name": "ALFA 10 mg tablet",
+                "alias": "ALFA",
+                "name_score": 1.0,
+            }
+        ],
+    )
 
     results = retrieval.get_top_chunks(
         "Alfa uyarıları nelerdir?",
@@ -41,13 +53,13 @@ def test_get_top_chunks_orders_and_returns_required_fields(monkeypatch):
         "ALFA 10 mg tablet",
         "BETA 20 mg tablet",
     ]
-    assert set(results[0]) == {
+    assert {
         "medicine_name",
         "chunk_type",
         "chunk_text",
         "similarity_score",
         "source_name",
-    }
+    }.issubset(results[0])
 
 
 def test_get_top_chunks_returns_empty_below_threshold(monkeypatch):
@@ -61,6 +73,18 @@ def test_get_top_chunks_returns_empty_below_threshold(monkeypatch):
                 "chunk_text": "Metin",
                 "embedding": [0.0, 1.0],
                 "source_name": "Kaynak",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        retrieval,
+        "find_candidate_medicines",
+        lambda *_, **__: [
+            {
+                "medicine_id": 1,
+                "medicine_name": "ALFA",
+                "alias": "ALFA",
+                "name_score": 1.0,
             }
         ],
     )
@@ -105,6 +129,18 @@ def test_debug_trace_contains_embedding_and_ranked_chunks(monkeypatch):
             }
         ],
     )
+    monkeypatch.setattr(
+        retrieval,
+        "find_candidate_medicines",
+        lambda *_, **__: [
+            {
+                "medicine_id": 1,
+                "medicine_name": "ALFA",
+                "alias": "ALFA",
+                "name_score": 1.0,
+            }
+        ],
+    )
     trace = {}
 
     results = retrieval.get_top_chunks(
@@ -119,3 +155,78 @@ def test_debug_trace_contains_embedding_and_ranked_chunks(monkeypatch):
     assert trace["query_embedding_preview"] == [1.0, 0.0]
     assert trace["top_chunks"][0]["medicine_name"] == "ALFA"
     assert trace["top_chunks"][0]["similarity_score"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Muscoflex yan etkileri neler?",
+        "Muscoflex yan etkisi nedir?",
+        "Muscoflex yan etkilerineler?",
+        "Muscoflex istenmeyen etkiler",
+        "Muscoflex yan etkilri neler?",
+    ],
+)
+def test_side_effect_intent_tolerates_turkish_variants_and_typos(question):
+    assert retrieval.detect_intent(question) == "SIDE_EFFECTS"
+
+
+def test_retrieval_does_not_search_global_chunks_without_medicine(monkeypatch):
+    monkeypatch.setattr(retrieval, "find_candidate_medicines", lambda *_, **__: [])
+
+    def fail_get_chunks(**_):
+        raise AssertionError("Global chunk scan must not run")
+
+    monkeypatch.setattr(retrieval, "get_chunks", fail_get_chunks)
+    trace = {}
+
+    assert retrieval.get_top_chunks("Bilinmeyen ilaç yan etkileri", debug_trace=trace) == []
+    assert trace["retrieval_state"] == "medicine_not_found"
+
+
+def test_irrelevant_sections_are_not_sent_as_semantic_fallback(monkeypatch):
+    monkeypatch.setattr(
+        retrieval,
+        "find_candidate_medicines",
+        lambda *_, **__: [
+            {
+                "medicine_id": 7,
+                "medicine_name": "MUSCOFLEX 8 MG",
+                "alias": "MUSCOFLEX",
+                "matched_alias": "MUSCOFLEX",
+                "match_type": "exact_alias",
+                "name_score": 1.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        retrieval,
+        "get_medicine_data_status",
+        lambda *_, **__: {
+            "medicine_exists": True,
+            "documents_count": 1,
+            "kt_count": 1,
+            "kub_count": 0,
+            "chunks_count": 1,
+            "side_effect_chunks": 0,
+            "dosage_chunks": 0,
+            "embeddings_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        retrieval,
+        "get_chunks",
+        lambda **_: [
+            {
+                "chunk_id": 1,
+                "medicine_name": "MUSCOFLEX 8 MG",
+                "chunk_type": "indications",
+                "chunk_text": "Yalnız endikasyon",
+                "embedding": [1.0, 0.0],
+            }
+        ],
+    )
+    trace = {}
+
+    assert retrieval.get_top_chunks("muscoflex yan etkileri", debug_trace=trace) == []
+    assert trace["retrieval_state"] == "section_missing"

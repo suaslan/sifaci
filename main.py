@@ -5,6 +5,7 @@ from config import (
     DATABASE_PATH,
     EMBEDDING_MODEL_NAME,
     FOUNDRY_MODEL_ALIAS,
+    MEDICINES_DIR,
     MEDICINE_DOCUMENTS_DIR,
 )
 from src.database import get_database_stats, initialize_database
@@ -16,6 +17,7 @@ def main() -> None:
     initialize_database()
     stats = get_database_stats()
     print(APP_TITLE)
+    print(f"Kanonik ilaç klasörü: {MEDICINES_DIR}")
     print(f"JSON klasörü: {MEDICINE_DOCUMENTS_DIR}")
     print(f"Veritabanı: {DATABASE_PATH}")
     print(f"İlaç / chunk: {stats['medicine_count']} / {stats['chunk_count']}")

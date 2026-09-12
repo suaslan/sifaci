@@ -1,0 +1,129 @@
+"""HTTP API exposing the local, safety-constrained Şifacı RAG pipeline."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from config import (
+    API_HOST,
+    API_PORT,
+    APP_NAME,
+    DATABASE_PATH,
+    EMBEDDING_MODEL_NAME,
+    FOUNDRY_MODEL_ALIAS,
+    MAX_QUESTION_CHARS,
+)
+from src.database import (
+    get_database_stats,
+    initialize_database,
+    require_database_content,
+)
+from src.rag import answer_query
+from src.response_format import parse_source_names, split_rag_response
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class AnswerRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+
+
+class AnswerResponse(BaseModel):
+    answer: str
+    sources: list[str]
+    disclaimer: str
+    suggestions: list[str] = Field(default_factory=list, max_length=5)
+
+
+class HealthResponse(BaseModel):
+    status: str
+    medicine_count: int
+    chunk_count: int
+    llm: str
+    embedding_model: str
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    initialize_database()
+    stats = require_database_content()
+    LOGGER.info(
+        "Medicine database ready: path=%s medicines=%s chunks=%s",
+        DATABASE_PATH,
+        stats["medicine_count"],
+        stats["chunk_count"],
+    )
+    yield
+
+
+app = FastAPI(
+    title=f"{APP_NAME} API",
+    description="Yerel ilaç bilgi asistanı RAG API'si.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+@app.get("/health", response_model=HealthResponse)
+def health_check() -> HealthResponse:
+    stats = get_database_stats()
+    return HealthResponse(
+        status="ok",
+        medicine_count=stats["medicine_count"],
+        chunk_count=stats["chunk_count"],
+        llm=FOUNDRY_MODEL_ALIAS,
+        embedding_model=EMBEDDING_MODEL_NAME,
+    )
+
+
+@app.post("/answer", response_model=AnswerResponse)
+def answer_medicine_question(payload: AnswerRequest) -> AnswerResponse:
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="Soru boş olamaz.")
+
+    try:
+        debug_trace: dict[str, object] = {}
+        raw_response = answer_query(question, debug_trace=debug_trace)
+    except Exception as error:
+        LOGGER.exception("Şifacı API could not generate an answer")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Yanıt oluşturulamadı. Foundry Local modellerini ve "
+                "veritabanındaki embedding kayıtlarını kontrol edin."
+            ),
+        ) from error
+
+    answer, source_names, disclaimer = split_rag_response(raw_response)
+    parsed_sources = parse_source_names(source_names)
+    raw_suggestions = debug_trace.get("similar_medicines")
+    suggestions = (
+        list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in raw_suggestions
+                if str(item).strip()
+            )
+        )[:5]
+        if isinstance(raw_suggestions, list)
+        else []
+    )
+    return AnswerResponse(
+        answer=answer,
+        sources=parsed_sources,
+        disclaimer=disclaimer,
+        suggestions=suggestions,
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("api:app", host=API_HOST, port=API_PORT, reload=False)

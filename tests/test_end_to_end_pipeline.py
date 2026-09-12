@@ -49,6 +49,10 @@ def test_json_to_streamlit_response_pipeline(tmp_path):
     assert stats == {
         "files": 1,
         "medicines": 1,
+        "inserted": 1,
+        "updated": 0,
+        "duplicates": 0,
+        "errors": 0,
         "chunks": 3,
         "skipped_examples": 0,
     }

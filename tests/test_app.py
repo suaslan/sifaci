@@ -3,6 +3,7 @@ from __future__ import annotations
 import app
 
 from app import split_rag_response
+from config import MISSING_INFORMATION_RESPONSE
 from src.rag import DISCLAIMER
 
 
@@ -26,6 +27,21 @@ def test_split_rag_response_has_safe_fallback():
     assert answer == "Düz cevap"
     assert sources == "Belirtilmemiş"
     assert disclaimer == DISCLAIMER
+
+
+def test_split_rag_response_removes_literal_svg_markup():
+    answer, _, _ = split_rag_response(
+        'Yanıt <svg viewBox="0 0 24 24"><path d="M1 1" /></svg> metni.'
+    )
+
+    assert answer == "Yanıt  metni."
+    assert "svg" not in answer.casefold()
+
+
+def test_split_rag_response_rejects_oversized_catalog_output():
+    answer, _, _ = split_rag_response("\n".join(f"İlaç {index}" for index in range(2_000)))
+
+    assert answer == MISSING_INFORMATION_RESPONSE
 
 
 class _DebugStreamlit:

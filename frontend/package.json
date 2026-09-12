@@ -1,0 +1,30 @@
+{
+  "name": "sifaci-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "set NODE_PATH=%CD%\\node_modules&& next dev",
+    "build": "set NODE_PATH=%CD%\\node_modules&& next build",
+    "start": "set NODE_PATH=%CD%\\node_modules&& next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "1.33.0",
+    "motion": "13.1.0",
+    "next": "16.3.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.3.1",
+    "tailwindcss": "4.3.3",
+    "typescript": "6.0.3"
+  },
+  "packageManager": "npm@11.12.1"
+}
