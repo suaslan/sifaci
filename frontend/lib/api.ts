@@ -12,7 +12,8 @@ export class MedicineApiError extends Error {
 }
 
 const MAX_DISPLAY_ANSWER_CHARS = 6_000;
-const missingInformationMessage = "İlgili bilgi belgelerde bulunamadı.";
+const missingInformationMessage =
+  "Bu soruyu yanıtlamak için bilgi tabanında yeterli kaynak bulunamadı.";
 
 function sanitizeAnswerText(value: string): string {
   const withoutSvg = value
@@ -60,6 +61,7 @@ export async function askMedicineAssistant(
 
   return {
     answer: sanitizeAnswerText(answer.answer),
+    medicine: typeof answer.medicine === "string" ? answer.medicine : null,
     sources: answer.sources,
     disclaimer: answer.disclaimer,
     suggestions: Array.isArray(answer.suggestions)

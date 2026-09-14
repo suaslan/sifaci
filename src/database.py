@@ -315,6 +315,23 @@ def _initialize_database_schema(database_path: Path) -> None:
                 UNIQUE (medicine_id, document_type, document_url)
             );
 
+            CREATE TABLE IF NOT EXISTS pending_document_links (
+                pending_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                document_type TEXT NOT NULL CHECK (document_type IN ('KUB', 'KT')),
+                document_url TEXT NOT NULL,
+                approval_date TEXT,
+                active_ingredient TEXT,
+                company TEXT,
+                reason TEXT NOT NULL,
+                candidate_details TEXT,
+                source TEXT NOT NULL DEFAULT 'TİTCK',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (document_type, document_url)
+            );
+
             CREATE TABLE IF NOT EXISTS sync_runs (
                 sync_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 mode TEXT NOT NULL,
@@ -434,6 +451,53 @@ def _initialize_database_schema(database_path: Path) -> None:
                 connection.execute(
                     f"ALTER TABLE document_chunks ADD COLUMN {column} {declaration}"
                 )
+
+        fts_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'medicine_chunks_fts'"
+        ).fetchone()
+        connection.executescript(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS medicine_chunks_fts USING fts5(
+                chunk_text,
+                section,
+                chunk_type,
+                content='document_chunks',
+                content_rowid='chunk_id',
+                tokenize='unicode61 remove_diacritics 2'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS document_chunks_fts_insert
+            AFTER INSERT ON document_chunks BEGIN
+                INSERT INTO medicine_chunks_fts(rowid, chunk_text, section, chunk_type)
+                VALUES (new.chunk_id, new.chunk_text, new.section, new.chunk_type);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS document_chunks_fts_delete
+            AFTER DELETE ON document_chunks BEGIN
+                INSERT INTO medicine_chunks_fts(
+                    medicine_chunks_fts, rowid, chunk_text, section, chunk_type
+                ) VALUES (
+                    'delete', old.chunk_id, old.chunk_text, old.section, old.chunk_type
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS document_chunks_fts_update
+            AFTER UPDATE OF chunk_text, section, chunk_type ON document_chunks BEGIN
+                INSERT INTO medicine_chunks_fts(
+                    medicine_chunks_fts, rowid, chunk_text, section, chunk_type
+                ) VALUES (
+                    'delete', old.chunk_id, old.chunk_text, old.section, old.chunk_type
+                );
+                INSERT INTO medicine_chunks_fts(rowid, chunk_text, section, chunk_type)
+                VALUES (new.chunk_id, new.chunk_text, new.section, new.chunk_type);
+            END;
+            """
+        )
+        if fts_exists is None:
+            connection.execute(
+                "INSERT INTO medicine_chunks_fts(medicine_chunks_fts) VALUES('rebuild')"
+            )
 
         document_columns = {
             str(row["name"])
@@ -756,6 +820,11 @@ def insert_chunk(
     embedding: Sequence[float] | str | None = None,
     embedding_model: str | None = None,
     *,
+    section: str | None = None,
+    source_url: str | None = None,
+    source_type: str | None = None,
+    source_date: str | None = None,
+    source_priority: int | None = None,
     database_path: str | Path | None = None,
 ) -> int:
     """Insert a document chunk and return its integer id."""
@@ -779,8 +848,9 @@ def insert_chunk(
             """
             INSERT INTO document_chunks
                 (medicine_id, chunk_text, chunk_type, embedding, embedding_model,
-                 embedding_status)
-            VALUES (?, ?, ?, ?, ?, ?)
+                 embedding_status, section, source_url, source_type, source_date,
+                 source_priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 medicine_id,
@@ -789,6 +859,11 @@ def insert_chunk(
                 serialized_embedding,
                 serialized_model,
                 "DONE" if serialized_embedding is not None else "PENDING",
+                _to_optional_text(section),
+                _to_optional_text(source_url),
+                _to_optional_text(source_type),
+                _to_optional_text(source_date),
+                source_priority,
             ),
         )
         return int(cursor.lastrowid)
@@ -933,6 +1008,73 @@ def get_chunks(
     with _read_connect(database_path) as connection:
         rows = connection.execute(query, parameters).fetchall()
 
+    chunks = [dict(row) for row in rows]
+    for chunk in chunks:
+        chunk["embedding"] = _deserialize_embedding(chunk["embedding"])
+    return chunks
+
+
+def search_medicine_chunks_fts(
+    question: str,
+    *,
+    medicine_ids: Sequence[int],
+    chunk_types: Sequence[str] | None = None,
+    limit: int = 20,
+    database_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Search medicine chunks with SQLite FTS5, restricted to resolved products."""
+
+    clean_ids = list(dict.fromkeys(int(value) for value in medicine_ids))
+    if not clean_ids or limit <= 0:
+        return []
+    tokens = [
+        token
+        for token in normalize_medicine_name(question).split()
+        if len(token) >= 3 and not token.isdigit()
+    ]
+    if not tokens:
+        return []
+    match_query = " OR ".join(f'"{token}"*' for token in dict.fromkeys(tokens))
+    conditions = [
+        f"dc.medicine_id IN ({', '.join('?' for _ in clean_ids)})",
+        "medicine_chunks_fts MATCH ?",
+    ]
+    parameters: list[Any] = [*clean_ids, match_query]
+    clean_types = [str(value).strip() for value in (chunk_types or []) if str(value).strip()]
+    if clean_types:
+        conditions.append(
+            f"dc.chunk_type IN ({', '.join('?' for _ in clean_types)})"
+        )
+        parameters.extend(clean_types)
+    parameters.append(int(limit))
+    with _read_connect(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT dc.chunk_id, dc.medicine_id, dc.document_id, dc.chunk_text,
+                   dc.chunk_type, dc.section, dc.chunk_hash, dc.source_url,
+                   dc.approval_date, dc.source_date, dc.embedding,
+                   dc.embedding_model, m.medicine_name, d.document_type,
+                   COALESCE(dc.source_type, CASE WHEN d.document_id IS NOT NULL
+                       THEN 'TITCK' ELSE 'USER' END) AS source_type,
+                   COALESCE(dc.source_priority, CASE d.document_type
+                       WHEN 'KUB' THEN 500 WHEN 'KT' THEN 450 ELSE 300 END)
+                       AS source_priority,
+                   CASE WHEN dc.source_type = 'ILACABAK' THEN 'İlacabak prospektüsü'
+                       WHEN dc.source_type = 'MANUFACTURER' THEN 'Üretici resmi belgesi'
+                       ELSE COALESCE(d.source || ' ' || d.document_type, m.source_name)
+                   END AS source_name,
+                   COALESCE(dc.source_url, m.source_reference) AS source_reference,
+                   bm25(medicine_chunks_fts) AS fts_rank
+            FROM medicine_chunks_fts
+            JOIN document_chunks AS dc ON dc.chunk_id = medicine_chunks_fts.rowid
+            JOIN medicines AS m ON m.medicine_id = dc.medicine_id
+            LEFT JOIN documents AS d ON d.document_id = dc.document_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY fts_rank, COALESCE(dc.source_priority, 0) DESC
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
     chunks = [dict(row) for row in rows]
     for chunk in chunks:
         chunk["embedding"] = _deserialize_embedding(chunk["embedding"])
@@ -1162,32 +1304,78 @@ def find_candidate_medicines(
     normalized_query = normalize_medicine_name(query)
     if not normalized_query:
         return []
+    compact_query = normalized_query.replace(" ", "")
     initialize_database(database_path)
     with _read_connect(database_path) as connection:
         exact_rows = connection.execute(
             """
-            SELECT DISTINCT m.medicine_id, m.medicine_name, a.alias,
-                   a.normalized_alias
+            SELECT DISTINCT m.medicine_id, m.medicine_name,
+                   m.active_ingredient, m.company, a.alias, a.normalized_alias
             FROM medicine_aliases AS a
             JOIN medicines AS m ON m.medicine_id = a.medicine_id
             WHERE (' ' || ? || ' ') LIKE ('% ' || a.normalized_alias || ' %')
-            ORDER BY LENGTH(a.normalized_alias) DESC, m.medicine_name
+               OR INSTR(?, REPLACE(a.normalized_alias, ' ', '')) > 0
+            ORDER BY LENGTH(REPLACE(a.normalized_alias, ' ', '')) DESC,
+                     m.medicine_name
             LIMIT ?
             """,
-            (normalized_query, limit),
+            (normalized_query, compact_query, max(limit * 4, limit)),
         ).fetchall()
         if exact_rows:
-            longest = max(len(str(row["normalized_alias"])) for row in exact_rows)
-            return [
-                dict(row)
-                | {
-                    "name_score": 1.0,
-                    "match_type": "exact_alias",
-                    "matched_alias": str(row["alias"]),
-                }
+            longest = max(
+                len(str(row["normalized_alias"]).replace(" ", ""))
                 for row in exact_rows
-                if len(str(row["normalized_alias"])) == longest
-            ][:limit]
+            )
+            longest_rows = [
+                row
+                for row in exact_rows
+                if len(str(row["normalized_alias"]).replace(" ", "")) == longest
+            ]
+            return _unique_medicine_matches(
+                longest_rows,
+                limit=limit,
+                match_type="exact_alias",
+                name_score=1.0,
+            )
+
+        ingredient_rows = connection.execute(
+            """
+            SELECT medicine_id, medicine_name, active_ingredient, company
+            FROM medicines
+            WHERE active_ingredient IS NOT NULL AND TRIM(active_ingredient) != ''
+            """
+        ).fetchall()
+        ingredient_matches: list[dict[str, Any]] = []
+        for row in ingredient_rows:
+            ingredient = str(row["active_ingredient"])
+            normalized_ingredient = normalize_medicine_name(ingredient)
+            ingredient_terms = [normalized_ingredient] + [
+                token
+                for token in normalized_ingredient.split()
+                if len(token) >= 4 and not token.isdigit()
+            ]
+            matched_term = next(
+                (
+                    term
+                    for term in ingredient_terms
+                    if term and f" {term} " in f" {normalized_query} "
+                ),
+                None,
+            )
+            if matched_term:
+                ingredient_matches.append(
+                    dict(row)
+                    | {
+                        "alias": ingredient,
+                        "normalized_alias": matched_term,
+                        "name_score": 0.98,
+                        "match_type": "active_ingredient",
+                        "matched_alias": ingredient,
+                    }
+                )
+        if ingredient_matches:
+            ingredient_matches.sort(key=lambda row: str(row["medicine_name"]))
+            return ingredient_matches[:limit]
 
         query_terms = _medicine_query_terms(normalized_query)
         if not query_terms:
@@ -1204,7 +1392,8 @@ def find_candidate_medicines(
                 matched_rows.extend(
                     connection.execute(
                         f"""
-                        SELECT m.medicine_id, m.medicine_name, a.alias,
+                        SELECT m.medicine_id, m.medicine_name,
+                               m.active_ingredient, m.company, a.alias,
                                a.normalized_alias
                         FROM medicine_aliases AS a
                         JOIN medicines AS m ON m.medicine_id = a.medicine_id
@@ -1226,7 +1415,8 @@ def find_candidate_medicines(
 
         alias_rows = connection.execute(
             """
-            SELECT m.medicine_id, m.medicine_name, a.alias, a.normalized_alias
+            SELECT m.medicine_id, m.medicine_name, m.active_ingredient,
+                   m.company, a.alias, a.normalized_alias
             FROM medicine_aliases AS a
             JOIN medicines AS m ON m.medicine_id = a.medicine_id
             """
@@ -1348,6 +1538,8 @@ def upsert_document(
         "raw_text": _to_optional_text(raw_text),
         "downloaded_at": _to_optional_text(downloaded_at),
         "source": _to_optional_text(source) or "TİTCK",
+        "download_status": "DONE" if local_path and content_hash else "PENDING",
+        "parse_status": "DONE" if raw_text and str(raw_text).strip() else "PENDING",
     }
     initialize_database(database_path)
     with _connect(database_path) as connection:
@@ -1422,15 +1614,53 @@ def register_document_catalog(
     inserted = 0
     updated = 0
     duplicates = 0
+    pending = 0
     with _connect(database_path) as connection:
         for item in documents:
-            medicine_id = int(item["medicine_id"])
             document_type = str(item["document_type"]).strip().upper()
             document_url = str(item["document_url"]).strip()
             if document_type not in {"KUB", "KT"} or not document_url:
                 raise ValueError("Each catalog document requires medicine_id, KUB/KT and URL")
             approval_date = _to_optional_text(item.get("approval_date"))
             source = _to_optional_text(item.get("source")) or "TİTCK"
+            if item.get("medicine_id") is None:
+                product_name = str(item.get("product_name") or "").strip()
+                if not product_name:
+                    raise ValueError("Unlinked catalog documents require product_name")
+                connection.execute(
+                    """
+                    INSERT INTO pending_document_links (
+                        product_name, normalized_name, document_type, document_url,
+                        approval_date, active_ingredient, company, reason,
+                        candidate_details, source, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(document_type, document_url) DO UPDATE SET
+                        product_name=excluded.product_name,
+                        normalized_name=excluded.normalized_name,
+                        approval_date=excluded.approval_date,
+                        active_ingredient=excluded.active_ingredient,
+                        company=excluded.company,
+                        reason=excluded.reason,
+                        candidate_details=excluded.candidate_details,
+                        source=excluded.source,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        product_name,
+                        normalize_medicine_name(product_name),
+                        document_type,
+                        document_url,
+                        approval_date,
+                        _to_optional_text(item.get("active_ingredient")),
+                        _to_optional_text(item.get("company")),
+                        str(item.get("link_reason") or "unresolved"),
+                        json.dumps(item.get("link_candidates") or [], ensure_ascii=False),
+                        source,
+                    ),
+                )
+                pending += 1
+                continue
+            medicine_id = int(item["medicine_id"])
             existing = connection.execute(
                 "SELECT document_id, document_url, approval_date, source FROM documents "
                 "WHERE medicine_id = ? AND document_type = ? ORDER BY document_id LIMIT 1",
@@ -1484,7 +1714,12 @@ def register_document_catalog(
                 ),
             )
             updated += 1
-    return {"inserted": inserted, "updated": updated, "duplicates": duplicates}
+    return {
+        "inserted": inserted,
+        "updated": updated,
+        "duplicates": duplicates,
+        "pending": pending,
+    }
 
 
 def get_sync_state(
@@ -2483,6 +2718,180 @@ def get_database_stats(
     }
 
 
+def get_medicine_readiness(
+    medicine_id: int,
+    *,
+    database_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return deterministic source/index readiness for one canonical medicine."""
+
+    initialize_database(database_path)
+    with _read_connect(database_path) as connection:
+        medicine = connection.execute(
+            "SELECT medicine_id, medicine_name FROM medicines WHERE medicine_id = ?",
+            (int(medicine_id),),
+        ).fetchone()
+        if medicine is None:
+            return {
+                "medicine_id": int(medicine_id),
+                "medicine_name": None,
+                "exists": False,
+                "is_ready": False,
+                "reasons": ["medicine_not_found"],
+                "semantic_families": [],
+            }
+        row = connection.execute(
+            """
+            SELECT
+                COUNT(DISTINCT d.document_id) AS document_count,
+                COUNT(DISTINCT CASE WHEN d.document_type = 'KT' THEN d.document_id END) AS kt_count,
+                COUNT(DISTINCT CASE WHEN d.document_type = 'KUB' THEN d.document_id END) AS kub_count,
+                COUNT(DISTINCT CASE WHEN d.download_status = 'DONE' THEN d.document_id END) AS downloaded_document_count,
+                COUNT(DISTINCT CASE WHEN d.parse_status = 'DONE' AND LENGTH(TRIM(COALESCE(d.raw_text, ''))) > 0 THEN d.document_id END) AS parsed_document_count,
+                COUNT(DISTINCT CASE WHEN d.status = 'DONE' THEN d.document_id END) AS completed_document_count,
+                COUNT(DISTINCT c.chunk_id) AS chunk_count,
+                COUNT(DISTINCT CASE WHEN c.embedding IS NOT NULL AND c.embedding <> '' AND c.embedding_status = 'DONE' THEN c.chunk_id END) AS embedded_chunk_count,
+                COUNT(DISTINCT CASE WHEN c.embedding IS NOT NULL AND c.embedding <> '' AND c.embedding_status = 'DONE' AND c.embedding_model = ? THEN c.chunk_id END) AS current_embedded_chunk_count,
+                COUNT(DISTINCT CASE WHEN f.rowid IS NOT NULL THEN c.chunk_id END) AS fts_chunk_count,
+                (SELECT COUNT(*) FROM document_chunks AS bad
+                 JOIN documents AS owner ON owner.document_id=bad.document_id
+                 WHERE owner.medicine_id=? AND bad.medicine_id<>owner.medicine_id) AS medicine_mismatch_count,
+                GROUP_CONCAT(DISTINCT c.chunk_type) AS semantic_families
+            FROM documents AS d
+            LEFT JOIN document_chunks AS c
+              ON c.document_id = d.document_id AND c.medicine_id = d.medicine_id
+            LEFT JOIN medicine_chunks_fts AS f ON f.rowid = c.chunk_id
+            WHERE d.medicine_id = ?
+            """,
+            (EMBEDDING_MODEL_NAME, int(medicine_id), int(medicine_id)),
+        ).fetchone()
+
+    values = dict(row) if row is not None else {}
+    chunk_count = int(values.get("chunk_count") or 0)
+    current_embedded = int(values.get("current_embedded_chunk_count") or 0)
+    fts_count = int(values.get("fts_chunk_count") or 0)
+    reasons: list[str] = []
+    if int(values.get("document_count") or 0) == 0:
+        reasons.append("source_document_missing")
+    if int(values.get("downloaded_document_count") or 0) == 0:
+        reasons.append("document_not_downloaded")
+    if int(values.get("parsed_document_count") or 0) == 0:
+        reasons.append("document_not_parsed")
+    if chunk_count == 0:
+        reasons.append("chunks_missing")
+    if chunk_count and current_embedded != chunk_count:
+        reasons.append("embeddings_missing_or_stale")
+    if chunk_count and fts_count != chunk_count:
+        reasons.append("fts_inconsistent")
+    if int(values.get("medicine_mismatch_count") or 0):
+        reasons.append("medicine_document_mismatch")
+
+    families = sorted(
+        value for value in str(values.get("semantic_families") or "").split(",") if value
+    )
+    return {
+        "medicine_id": int(medicine["medicine_id"]),
+        "medicine_name": str(medicine["medicine_name"]),
+        "exists": True,
+        "is_ready": not reasons,
+        "has_official_source_document": int(values.get("document_count") or 0) > 0,
+        "kt_present": int(values.get("kt_count") or 0) > 0,
+        "kub_present": int(values.get("kub_count") or 0) > 0,
+        "document_count": int(values.get("document_count") or 0),
+        "downloaded_document_count": int(values.get("downloaded_document_count") or 0),
+        "parsed_document_count": int(values.get("parsed_document_count") or 0),
+        "completed_document_count": int(values.get("completed_document_count") or 0),
+        "chunk_count": chunk_count,
+        "embedded_chunk_count": int(values.get("embedded_chunk_count") or 0),
+        "current_embedded_chunk_count": current_embedded,
+        "fts_chunk_count": fts_count,
+        "medicine_mismatch_count": int(values.get("medicine_mismatch_count") or 0),
+        "semantic_families": families,
+        "reasons": reasons,
+    }
+
+
+def get_ready_medicines(
+    *,
+    limit: int | None = None,
+    database_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return only medicines whose local source, chunks and indexes are complete."""
+
+    if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0):
+        raise ValueError("limit must be a positive integer")
+    initialize_database(database_path)
+    parameters: list[Any] = [EMBEDDING_MODEL_NAME]
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = " LIMIT ?"
+        parameters.append(limit)
+    with _read_connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            WITH readiness AS (
+                SELECT m.medicine_id, m.medicine_name,
+                       COUNT(DISTINCT d.document_id) AS document_count,
+                       COUNT(DISTINCT CASE WHEN d.document_type='KT' THEN d.document_id END) AS kt_count,
+                       COUNT(DISTINCT CASE WHEN d.document_type='KUB' THEN d.document_id END) AS kub_count,
+                       COUNT(DISTINCT CASE WHEN d.download_status='DONE' THEN d.document_id END) AS downloaded_document_count,
+                       COUNT(DISTINCT CASE WHEN d.parse_status='DONE' AND LENGTH(TRIM(COALESCE(d.raw_text,'')))>0 THEN d.document_id END) AS parsed_document_count,
+                       COUNT(DISTINCT c.chunk_id) AS chunk_count,
+                       COUNT(DISTINCT CASE WHEN c.embedding IS NOT NULL AND c.embedding<>'' AND c.embedding_status='DONE' AND c.embedding_model=? THEN c.chunk_id END) AS current_embedded_chunk_count,
+                       COUNT(DISTINCT CASE WHEN f.rowid IS NOT NULL THEN c.chunk_id END) AS fts_chunk_count,
+                       GROUP_CONCAT(DISTINCT c.chunk_type) AS semantic_families
+                FROM medicines AS m
+                JOIN documents AS d ON d.medicine_id=m.medicine_id
+                LEFT JOIN document_chunks AS c ON c.document_id=d.document_id AND c.medicine_id=d.medicine_id
+                LEFT JOIN medicine_chunks_fts AS f ON f.rowid=c.chunk_id
+                GROUP BY m.medicine_id, m.medicine_name
+            )
+            SELECT * FROM readiness
+            WHERE document_count>0 AND downloaded_document_count>0
+              AND parsed_document_count>0 AND chunk_count>0
+              AND current_embedded_chunk_count=chunk_count
+              AND fts_chunk_count=chunk_count
+            ORDER BY medicine_name, medicine_id
+            """ + limit_clause,
+            parameters,
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["semantic_families"] = sorted(
+            value for value in str(item.get("semantic_families") or "").split(",") if value
+        )
+        item["is_ready"] = True
+        result.append(item)
+    return result
+
+
+def get_readiness_stats(
+    database_path: str | Path | None = None,
+) -> dict[str, int]:
+    """Return truthful catalog/READY counts for API and UI status."""
+
+    initialize_database(database_path)
+    with _read_connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM medicines) AS catalog_medicine_count,
+                (SELECT COUNT(*) FROM document_chunks) AS chunk_count,
+                (SELECT COUNT(*) FROM document_chunks WHERE embedding IS NOT NULL AND embedding<>'' AND embedding_status='DONE' AND embedding_model=?) AS embedded_chunk_count,
+                (SELECT COUNT(*) FROM medicine_chunks_fts) AS fts_chunk_count
+            """,
+            (EMBEDDING_MODEL_NAME,),
+        ).fetchone()
+    return {
+        "catalog_medicine_count": int(row["catalog_medicine_count"]),
+        "ready_medicine_count": len(get_ready_medicines(database_path=database_path)),
+        "chunk_count": int(row["chunk_count"]),
+        "embedded_chunk_count": int(row["embedded_chunk_count"]),
+        "fts_chunk_count": int(row["fts_chunk_count"]),
+    }
+
+
 def get_medicine_data_status(
     medicine_ids: Sequence[int],
     *,
@@ -2765,6 +3174,119 @@ def get_all_medicines(
             "SELECT * FROM medicines ORDER BY medicine_id"
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def merge_medicine_into_canonical(
+    duplicate_medicine_id: int,
+    canonical_medicine_id: int,
+    *,
+    database_path: str | Path | None = None,
+) -> dict[str, int]:
+    """Transactionally relink every source record before removing one duplicate."""
+
+    duplicate_id = int(duplicate_medicine_id)
+    canonical_id = int(canonical_medicine_id)
+    if duplicate_id == canonical_id:
+        raise ValueError("duplicate and canonical medicine ids must differ")
+    initialize_database(database_path)
+    moved_documents = 0
+    merged_documents = 0
+    with _connect(database_path) as connection:
+        duplicate = connection.execute(
+            "SELECT * FROM medicines WHERE medicine_id=?", (duplicate_id,)
+        ).fetchone()
+        canonical = connection.execute(
+            "SELECT * FROM medicines WHERE medicine_id=?", (canonical_id,)
+        ).fetchone()
+        if duplicate is None or canonical is None:
+            raise ValueError("duplicate and canonical medicines must both exist")
+
+        for document in connection.execute(
+            "SELECT * FROM documents WHERE medicine_id=? ORDER BY document_id",
+            (duplicate_id,),
+        ).fetchall():
+            existing = connection.execute(
+                "SELECT document_id FROM documents WHERE medicine_id=? "
+                "AND document_type=? AND document_url=? ORDER BY document_id LIMIT 1",
+                (canonical_id, document["document_type"], document["document_url"]),
+            ).fetchone()
+            if existing is not None:
+                target_document_id = int(existing["document_id"])
+                connection.execute(
+                    "UPDATE document_chunks SET medicine_id=?, document_id=? WHERE document_id=?",
+                    (canonical_id, target_document_id, document["document_id"]),
+                )
+                connection.execute(
+                    "DELETE FROM documents WHERE document_id=?", (document["document_id"],)
+                )
+                merged_documents += 1
+            else:
+                connection.execute(
+                    "UPDATE documents SET medicine_id=? WHERE document_id=?",
+                    (canonical_id, document["document_id"]),
+                )
+                connection.execute(
+                    "UPDATE document_chunks SET medicine_id=? WHERE document_id=?",
+                    (canonical_id, document["document_id"]),
+                )
+                moved_documents += 1
+
+        moved_unlinked_chunks = int(
+            connection.execute(
+                "UPDATE document_chunks SET medicine_id=? WHERE medicine_id=?",
+                (canonical_id, duplicate_id),
+            ).rowcount
+        )
+        connection.execute(
+            "UPDATE medicine_dosage_rules SET medicine_id=? WHERE medicine_id=?",
+            (canonical_id, duplicate_id),
+        )
+        target_ilacabak = connection.execute(
+            "SELECT id FROM ilacabak_documents WHERE medicine_id=?", (canonical_id,)
+        ).fetchone()
+        source_ilacabak = connection.execute(
+            "SELECT id FROM ilacabak_documents WHERE medicine_id=?", (duplicate_id,)
+        ).fetchone()
+        if source_ilacabak is not None:
+            if target_ilacabak is None:
+                connection.execute(
+                    "UPDATE ilacabak_documents SET medicine_id=? WHERE id=?",
+                    (canonical_id, source_ilacabak["id"]),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM ilacabak_documents WHERE id=?", (source_ilacabak["id"],)
+                )
+
+        alias_rows = connection.execute(
+            "SELECT alias,normalized_alias FROM medicine_aliases WHERE medicine_id=?",
+            (duplicate_id,),
+        ).fetchall()
+        connection.executemany(
+            "INSERT OR IGNORE INTO medicine_aliases (medicine_id,alias,normalized_alias) VALUES (?,?,?)",
+            [(canonical_id, row["alias"], row["normalized_alias"]) for row in alias_rows]
+            + [(
+                canonical_id,
+                duplicate["medicine_name"],
+                normalize_medicine_name(str(duplicate["medicine_name"])),
+            )],
+        )
+        fillable = (
+            "active_ingredient", "company", "license_number", "license_date",
+            "barcode", "pharmaceutical_form", "strength", "source_reference",
+        )
+        for field in fillable:
+            if not canonical[field] and duplicate[field]:
+                connection.execute(
+                    f"UPDATE medicines SET {field}=? WHERE medicine_id=?",
+                    (duplicate[field], canonical_id),
+                )
+        connection.execute("DELETE FROM medicines WHERE medicine_id=?", (duplicate_id,))
+    return {
+        "moved_documents": moved_documents,
+        "merged_documents": merged_documents,
+        "moved_unlinked_chunks": moved_unlinked_chunks,
+    }
 
 
 def mark_unseen_titck_products(

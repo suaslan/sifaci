@@ -6,6 +6,10 @@ uygulamasıdır. Next.js arayüzü FastAPI üzerinden, Streamlit arayüzü ise
 doğrudan Python katmanından aynı güvenli `answer_query()` akışını kullanır.
 Kişisel reçete, tanı, doz hesabı veya tedavi önerisi vermez.
 
+Soru yanıtlama sırasında internet veya API anahtarı gerekmez. İlaç çözümleme,
+FTS5/embedding retrieval ve cevap üretimi yerel SQLite verisi ile Microsoft
+Foundry Local modelleri üzerinde çalışır.
+
 ## Hızlı başlatma
 
 İlk kullanımda D: depolamasını ve sanal ortamı hazırlayın:
@@ -38,6 +42,28 @@ Veri zincirini model çağırmadan kontrol etmek için:
 .\scripts\run_python.ps1 -m scripts.diagnose_database --skip-retrieval
 ```
 
+Gerçekten yanıtlanabilir ilaç sayısını denetlemek ve MVP eşiğine yalnızca
+gerektiği kadar veri işleyerek ulaşmak için:
+
+```powershell
+.\scripts\run_python.ps1 -m scripts.prepare_mvp_dataset --target-ready 200
+.\scripts\run_python.ps1 -m scripts.validate_mvp
+```
+
+`READY`, yalnızca katalogda bulunmak demek değildir. Belgesi indirilmiş ve
+ayrıştırılmış, chunk'ları aynı kanonik ilaca bağlı, güncel yerel embeddingleri
+ve FTS5 kayıtları eksiksiz ilaçları ifade eder. `/health` yanıtı bu nedenle
+`catalog_medicine_count` ile `ready_medicine_count` değerlerini ayrı bildirir.
+
+Eski KÜB/KT adlandırmalarının oluşturduğu olası çift kayıtlar önce salt-okunur
+olarak incelenebilir. Belirsiz eşleşmeler otomatik birleştirilmez:
+
+```powershell
+.\scripts\run_python.ps1 -m scripts.repair_medicine_links
+# Rapor onaylandıktan sonra, SQLite yedeği oluşturarak uygular:
+.\scripts\run_python.ps1 -m scripts.repair_medicine_links --apply
+```
+
 Embedding ve retrieval dahil tam kontrol için:
 
 ```powershell
@@ -49,13 +75,12 @@ Embedding ve retrieval dahil tam kontrol için:
 ```text
 D:\SifaciAI\data\medicines\*.{json,csv}
   -> src.ingestion (doğrulama ve güvenli chunking)
-  -> Microsoft Foundry Local embedding modeli
-  -> SQLite medicines + document_chunks
-  -> soru embedding'i + cosine similarity
-  -> en alakalı chunk'lar
+  -> SQLite medicines + document_chunks + FTS5
+  -> ilaç/etkin madde çözümleme
+  -> FTS5 (ve mevcutsa embedding) ile en alakalı KÜB/KT parçaları
   -> güvenlik sınırlı RAG context
   -> Microsoft Foundry Local chat modeli
-  -> FastAPI / Streamlit
+  -> FastAPI POST /api/chat / Streamlit
   -> Şifacı cevap kartı ve kaynak listesi
 ```
 
@@ -85,12 +110,36 @@ src/ingestion.py               JSON okuma, chunking ve embedding
 src/embeddings.py              Foundry Local embedding istemcisi
 src/retrieval.py               Cosine similarity ve isim önceliği
 src/rag.py                     Güvenlik sınırlı retrieval-augmented cevap
+src/medicine_service.py        İlaç/etkin madde arama ve ilgili chunk servisi
 src/foundry_runtime.py         Paylaşılan Foundry Local SDK başlatma katmanı
 src/foundry_client.py          Foundry Local chat istemcisi
 scripts/debug_medicine.py      İlaç/doküman/chunk/embedding durum tabloları
 scripts/debug_query.py         Intent, eşleşme, cosine skor ve LLM context izi
 scripts/data_coverage.py       Katalog kapsama sayıları ve yüzdeleri
 tests/                         Birim, güvenlik ve uçtan uca akış testleri
+```
+
+## Chat API
+
+Backend'i doğrudan başlatmak ve RAG endpoint'ini çağırmak için:
+
+```powershell
+.\scripts\run_python.ps1 api.py
+
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8000/api/chat `
+  -ContentType "application/json" `
+  -Body '{"message":"Parolun yan etkileri nelerdir?"}'
+```
+
+Yanıt `answer`, tespit edilen `medicine`, `sources`, `disclaimer` ve gerektiğinde
+ürün formu `suggestions` alanlarını içerir.
+
+İzole örnek veritabanı ve testler:
+
+```powershell
+.\scripts\run_python.ps1 -m scripts.seed_medicines
+.\scripts\run_python.ps1 -m pytest -q
 ```
 
 ## JSON ve CSV formatı

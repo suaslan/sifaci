@@ -43,10 +43,10 @@ export async function POST(request: Request) {
   }
 
   try {
-    const backendResponse = await fetch(`${backendUrl}/answer`, {
+    const backendResponse = await fetch(`${backendUrl}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ message: question }),
       cache: "no-store",
       signal: AbortSignal.timeout(backendTimeoutMs),
     });

@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
-from difflib import SequenceMatcher
 from typing import Any
 
 from config import (
@@ -16,7 +15,15 @@ from config import (
     SAFETY_DISCLAIMER,
     SOURCE_SECTION_MARKER,
 )
-from src.foundry_client import complete_chat
+from src.foundry_client import FoundryLocalError, complete_chat
+from src.intents import (
+    INTENT_CHUNK_TYPES,
+    INTENT_LABELS,
+    chunk_supports_intent,
+    detect_intent,
+    normalize_text,
+)
+from src.medicine_resolution import medicine_signature
 from src.retrieval import get_top_chunks
 
 
@@ -42,98 +49,12 @@ _MEDICAL_QUANTITY = re.compile(
     re.IGNORECASE,
 )
 
-_QUESTION_INTENTS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
-    (
-        re.compile(r"\b(?:yan\s+etki|yan\s+etkiler|istenmeyen\s+etki)", re.IGNORECASE),
-        ("common_side_effects", "side_effects", "serious_side_effects", "warnings"),
-    ),
-    (
-        re.compile(r"\b(?:ciddi|ağır)\b.*\b(?:yan\s+etki|reaksiyon)", re.IGNORECASE),
-        ("serious_side_effects", "warnings"),
-    ),
-    (
-        re.compile(r"\b(?:etken|etkin|aktif)\s+madde", re.IGNORECASE),
-        ("active_ingredient",),
-    ),
-    (
-        re.compile(r"\b(?:ne\s+için|hangi\s+durum|endikasyon)", re.IGNORECASE),
-        ("indications",),
-    ),
-    (
-        re.compile(r"\b(?:nasıl\s+kullan|kullanım\s+şekli)", re.IGNORECASE),
-        ("usage", "route_of_administration", "dosage", "frequency"),
-    ),
-    (
-        re.compile(r"\b(?:uygulama\s+yolu|ağızdan|oral|damardan)", re.IGNORECASE),
-        ("route_of_administration",),
-    ),
-    (
-        re.compile(r"\b(?:sıklık|kaç\s+kez|günde\s+kaç)", re.IGNORECASE),
-        ("frequency",),
-    ),
-    (re.compile(r"\bdoz", re.IGNORECASE), ("dosage",)),
-    (
-        re.compile(r"\b(?:kontrendikasyon|kimler\s+kullanma|kullanılmamalı)", re.IGNORECASE),
-        ("contraindications",),
-    ),
-    (
-        re.compile(r"\b(?:etkileşim|birlikte\s+kullan)", re.IGNORECASE),
-        ("interactions",),
-    ),
-    (re.compile(r"\b(?:uyarı|dikkat)", re.IGNORECASE), ("warnings",)),
-    (re.compile(r"\b(?:saklama|nasıl\s+saklan)", re.IGNORECASE), ("storage",)),
-)
-
-_CHUNK_TYPE_LABELS = {
-    "active_ingredient": "Etken madde",
-    "indications": "Kullanım alanı",
-    "usage": "Genel kullanım bilgisi",
-    "dosage": "Genel doz bilgisi",
-    "frequency": "Genel kullanım sıklığı",
-    "route_of_administration": "Uygulama yolu",
-    "side_effects": "Kaynakta bildirilen yan etkiler",
-    "common_side_effects": "Kaynakta bildirilen yan etkiler",
-    "serious_side_effects": "Ciddi yan etkiler",
-    "warnings": "Önemli uyarılar",
-    "contraindications": "Kontrendikasyonlar",
-    "interactions": "Etkileşimler",
-    "storage": "Saklama koşulları",
-}
-
-_MEDICINE_FORM_WORDS = {
-    "ampul",
-    "film",
-    "flakon",
-    "kapsul",
-    "mg",
-    "ml",
-    "saşe",
-    "surup",
-    "tablet",
-}
-_TURKISH_NAME_SUFFIXES = {
-    "i",
-    "ı",
-    "u",
-    "ü",
-    "in",
-    "ın",
-    "un",
-    "ün",
-    "a",
-    "e",
-    "da",
-    "de",
-    "dan",
-    "den",
-    "la",
-    "le",
-}
 _GENERIC_QUERY_TOKENS = {
     "bu",
     "ciddi",
     "doz",
     "etken",
+    "etkiler",
     "etkileri",
     "gunde",
     "hangi",
@@ -154,6 +75,9 @@ _GENERIC_QUERY_TOKENS = {
 }
 
 _GENERIC_ANSWER_TOKENS = _GENERIC_QUERY_TOKENS | {
+    "aktarilir",
+    "belge",
+    "belgeler",
     "bilgi",
     "bilgilere",
     "bulunabilmeniz",
@@ -171,8 +95,36 @@ _UNHELPFUL_MODEL_PHRASES = (
     "veri tabanında bulunabilmeniz",
     "kaynakta veri tabanında",
     "bu bilgilere göre kaynakta",
+    "ilaç bilgi asistanısın",
+    "kaynakla sınırlandırılmış",
+    "zorunlu kurallar",
 )
 _FALLBACK_ITEM_LIMIT = 12
+
+_CHUNK_TYPE_LABELS = {
+    "general": "Genel ürün bilgisi",
+    "active_ingredient": "Etken madde",
+    "indications": "Kullanım alanı",
+    "usage": "Genel kullanım bilgisi",
+    "dosage": "Genel doz bilgisi",
+    "frequency": "Genel kullanım sıklığı",
+    "route_of_administration": "Uygulama yolu",
+    "side_effects": "Kaynakta bildirilen yan etkiler",
+    "common_side_effects": "Kaynakta bildirilen yan etkiler",
+    "serious_side_effects": "Ciddi yan etkiler",
+    "warnings": "Önemli uyarılar",
+    "contraindications": "Kontrendikasyonlar",
+    "interactions": "Etkileşimler",
+    "pregnancy": "Gebelik",
+    "breastfeeding": "Emzirme",
+    "lactation": "Emzirme",
+    "driving": "Araç ve makine kullanımı",
+    "overdose": "Doz aşımı",
+    "storage": "Saklama koşulları",
+    "special_populations": "Özel popülasyonlar",
+    "missed_dose": "Unutulan doz",
+    "stopping_treatment": "Tedavinin bırakılması",
+}
 
 
 def answer_query(
@@ -226,12 +178,30 @@ def answer_query(
             debug_trace["model_call_block_reason"] = "Kişiye özel tedavi/doz isteği engellendi."
         return _personalized_safe_answer(chunks)
 
-    if not _question_matches_retrieved_medicine(question, chunks):
+    if retrieval_function is not get_top_chunks and not _custom_retrieval_matches_question(
+        question, chunks
+    ):
         if debug_trace is not None:
-            debug_trace["model_call_block_reason"] = (
-                "Sorudaki ilaç adı retrieved sonuçlardaki kayıtlı ilaçlarla eşleşmedi."
-            )
+            debug_trace["model_call_block_reason"] = "Özel retrieval sonucu sorudaki ilaçla eşleşmedi."
         return _finalize(MISSING_INFORMATION_RESPONSE, [])
+
+    grounded_fallback = _grounded_field_fallback(question, chunks)
+    # Direct prospectus questions are safer and much faster when rendered from
+    # the already-resolved local evidence. General/free-form questions still
+    # use Foundry Local for composition, and injected test/model functions keep
+    # exercising the complete model-safety path.
+    if (
+        retrieval_function is get_top_chunks
+        and chat_function is complete_chat
+        and grounded_fallback
+    ):
+        if debug_trace is not None:
+            debug_trace["model_called"] = False
+            debug_trace["model_call_block_reason"] = "deterministic_direct_answer"
+            debug_trace["response_safety_action"] = (
+                "Doğrudan prospektüs sorusu yerel kaynak kanıtından oluşturuldu."
+            )
+        return _finalize(grounded_fallback, chunks)
 
     safety_notes = _build_safety_notes(chunks)
     user_prompt = (
@@ -243,7 +213,6 @@ def answer_query(
         debug_trace["llm_system_prompt"] = SYSTEM_PROMPT
         debug_trace["llm_user_prompt"] = user_prompt
         debug_trace["model_called"] = True
-    grounded_fallback = _grounded_field_fallback(question, chunks)
     try:
         answer = chat_function(
             [
@@ -292,13 +261,18 @@ def answer_query(
     # A generated dose/duration quantity not present in the evidence is a
     # deterministic safety failure, regardless of the model's wording.
     if not used_grounded_fallback and _contains_unsupported_quantity(answer, chunks):
-        answer = MISSING_INFORMATION_RESPONSE
+        answer = grounded_fallback or MISSING_INFORMATION_RESPONSE
+        used_grounded_fallback = bool(grounded_fallback)
         if debug_trace is not None:
             debug_trace["response_safety_action"] = (
                 "Kaynakta bulunmayan tıbbi miktar nedeniyle model yanıtı reddedildi."
             )
 
-    if _has_critical_source(chunks) and not _CRITICAL_TERMS.search(answer):
+    if (
+        answer != MISSING_INFORMATION_RESPONSE
+        and _has_critical_source(chunks)
+        and not _CRITICAL_TERMS.search(answer)
+    ):
         answer = (
             "Önemli güvenlik uyarısı: Kaynaklarda ciddi yan etki veya acil "
             "değerlendirme uyarısı bulunmaktadır.\n\n" + answer
@@ -313,6 +287,12 @@ def _retrieval_fallback(trace: Mapping[str, Any] | None) -> str:
     medicine = str(trace.get("detected_medicine") or "İlaç").strip()
     if state == "medicine_not_found":
         return CATALOG_NOT_FOUND_RESPONSE
+    if state == "medicine_ambiguous":
+        return (
+            "Birden fazla ürün formu bulundu. Kullanım ve doz bilgileri ürüne "
+            "göre değişebileceği için lütfen aşağıdaki işlenmiş ürünlerden tam "
+            "olanı seçin."
+        )
     if state == "rag_not_processed":
         return (
             f"{medicine} kayıtlı ancak KÜB/Kullanma Talimatı henüz yerel "
@@ -352,65 +332,12 @@ def _is_personalized_treatment_request(question: str) -> bool:
 
 def _requested_chunk_types(question: str) -> tuple[str, ...]:
     """Map a direct Turkish medicine question to stored evidence categories."""
-
-    requested: list[str] = []
-    for pattern, chunk_types in _QUESTION_INTENTS:
-        if pattern.search(question):
-            for chunk_type in chunk_types:
-                if chunk_type not in requested:
-                    requested.append(chunk_type)
-    return tuple(requested)
-
-
-def _question_matches_retrieved_medicine(
-    question: str, chunks: Sequence[Mapping[str, Any]]
-) -> bool:
-    """Require an exact, suffixed, or fuzzy registered brand mention."""
-
-    question_tokens = _normalized_word_tokens(question)
-    if not question_tokens:
-        return False
-
-    medicine_candidates: list[str] = []
-    for index, token in enumerate(question_tokens):
-        if token.startswith("ilac") and index > 0:
-            previous = question_tokens[index - 1]
-            if previous not in _GENERIC_QUERY_TOKENS:
-                medicine_candidates.append(previous)
-    first_token = question_tokens[0]
-    if first_token not in _GENERIC_QUERY_TOKENS:
-        medicine_candidates.append(first_token)
-    medicine_candidates = list(dict.fromkeys(medicine_candidates))
-
-    # Generic questions remain usable (especially with a single-record test
-    # database). Once a likely product name is present, it must match a
-    # retrieved registered brand before the LLM is allowed to answer.
-    if not medicine_candidates:
-        return True
-
-    brands: list[str] = []
-    for chunk in chunks:
-        name_tokens = [
-            token
-            for token in _normalized_word_tokens(str(chunk.get("medicine_name") or ""))
-            if len(token) >= 3 and not token.isdigit() and token not in _MEDICINE_FORM_WORDS
-        ]
-        if name_tokens and name_tokens[0] not in brands:
-            brands.append(name_tokens[0])
-
-    for brand in brands:
-        for token in medicine_candidates:
-            if token == brand:
-                return True
-            if token.startswith(brand) and token[len(brand) :] in _TURKISH_NAME_SUFFIXES:
-                return True
-            if len(brand) >= 4 and SequenceMatcher(None, token, brand).ratio() >= 0.8:
-                return True
-    return False
+    return tuple(INTENT_CHUNK_TYPES.get(detect_intent(question), ()))
 
 
 def _normalized_word_tokens(text: str) -> list[str]:
-    decomposed = unicodedata.normalize("NFKD", text.casefold())
+    translated = text.casefold().translate(str.maketrans({"ı": "i", "ş": "s"}))
+    decomposed = unicodedata.normalize("NFKD", translated)
     without_marks = "".join(
         character for character in decomposed if not unicodedata.combining(character)
     )
@@ -433,12 +360,20 @@ def _grounded_field_fallback(
 ) -> str | None:
     """Render exact retrieved fields when the local LLM falsely says no data."""
 
+    intent = detect_intent(question)
     requested_types = _requested_chunk_types(question)
-    if not requested_types:
+    if intent == "GENERAL" or not requested_types:
         return None
 
     matched = [
-        chunk for chunk in chunks if str(chunk.get("chunk_type") or "") in requested_types
+        chunk
+        for chunk in chunks
+        if str(chunk.get("retrieval_intent") or "") == intent
+        or chunk_supports_intent(
+            str(chunk.get("chunk_type") or ""),
+            f"{chunk.get('section') or ''}\n{chunk.get('chunk_text') or ''}",
+            intent,
+        )
     ]
     if not matched:
         return None
@@ -452,28 +387,33 @@ def _grounded_field_fallback(
 
     sections: list[str] = []
     for chunk_type in requested_types:
-        bodies = [
-            _source_body(str(chunk.get("chunk_text") or "")).strip()
-            for chunk in matched
-            if chunk.get("chunk_type") == chunk_type
-        ]
-        bodies = [body for body in bodies if body]
-        if not bodies:
-            continue
-        label = _CHUNK_TYPE_LABELS.get(chunk_type, chunk_type)
         items: list[str] = []
-        for body in bodies:
-            items.extend(_source_items(body))
+        for chunk in matched:
+            if str(chunk.get("chunk_type") or "") != chunk_type:
+                continue
+            body = _source_body(str(chunk.get("chunk_text") or "")).strip()
+            if body:
+                items.extend(_source_items(body))
         unique_items = list(dict.fromkeys(items))[:_FALLBACK_ITEM_LIMIT]
-        if not unique_items:
-            continue
-        rendered = "\n".join(f"- {item}" for item in unique_items)
-        sections.append(f"{label}:\n{rendered}")
-
+        if unique_items:
+            label = _CHUNK_TYPE_LABELS.get(chunk_type, INTENT_LABELS.get(intent, chunk_type))
+            sections.append(f"{label}:\n" + "\n".join(f"- {item}" for item in unique_items))
+    if not sections:
+        items = []
+        for chunk in matched:
+            body = _source_body(str(chunk.get("chunk_text") or "")).strip()
+            if body:
+                items.extend(_source_items(body))
+        unique_items = list(dict.fromkeys(items))[:_FALLBACK_ITEM_LIMIT]
+        if unique_items:
+            sections.append(
+                f"{INTENT_LABELS.get(intent, 'Kayıtlı kaynak bilgisi')}:\n"
+                + "\n".join(f"- {item}" for item in unique_items)
+            )
     if not sections:
         return None
     answer = f"{heading} için kayıtlı kaynak bilgileri:\n\n" + "\n\n".join(sections)
-    if {"usage", "dosage", "frequency"} & set(requested_types):
+    if intent in {"USAGE", "DOSAGE", "FREQUENCY", "ROUTE_OF_ADMINISTRATION", "MISSED_DOSE", "STOPPING_TREATMENT"}:
         answer += (
             "\n\nBu kullanım bilgisi ürün/form ve kullanım amacına göre değişebilir; "
             "kişisel doz önerisi değildir."
@@ -570,10 +510,13 @@ def _model_answer_needs_grounded_fallback(
 ) -> bool:
     """Reject output that does not communicate a concrete retrieved fact."""
 
-    normalized = " ".join(answer.casefold().split())
+    normalized = " ".join(_normalized_word_tokens(answer))
     if len(answer) > 1_500:
         return True
-    if any(phrase in normalized for phrase in _UNHELPFUL_MODEL_PHRASES):
+    if any(
+        " ".join(_normalized_word_tokens(phrase)) in normalized
+        for phrase in _UNHELPFUL_MODEL_PHRASES
+    ):
         return True
     if any(
         marker in normalized
@@ -581,22 +524,81 @@ def _model_answer_needs_grounded_fallback(
     ):
         return True
 
+    all_answer_tokens = {token for token in _normalized_word_tokens(answer) if len(token) >= 4}
+    all_evidence_tokens = {
+        token
+        for chunk in chunks
+        for token in _normalized_word_tokens(_source_body(str(chunk.get("chunk_text") or "")))
+        if len(token) >= 4
+    }
+    if all_answer_tokens & all_evidence_tokens:
+        return False
+
     answer_tokens = {
         token
         for token in _normalized_word_tokens(answer)
         if len(token) >= 4 and token not in _GENERIC_ANSWER_TOKENS
     }
-    return not answer_tokens
+    if not answer_tokens:
+        return True
+
+    evidence_tokens = {
+        token
+        for chunk in chunks
+        for token in _normalized_word_tokens(
+            _source_body(str(chunk.get("chunk_text") or ""))
+        )
+        if len(token) >= 4 and token not in _GENERIC_ANSWER_TOKENS
+    }
+    return not bool(answer_tokens & evidence_tokens)
+
+
+def _custom_retrieval_matches_question(
+    question: str, chunks: Sequence[Mapping[str, Any]]
+) -> bool:
+    """Protect injected/test retrievers; production uses canonical medicine ids."""
+
+    question_tokens = _normalized_word_tokens(question)
+    if not question_tokens:
+        return False
+    generic = _GENERIC_QUERY_TOKENS | {"kullanma", "kullanmali", "etkilesir", "hamilelikte", "emzirirken"}
+    likely_names = [token for token in question_tokens if len(token) >= 3 and token not in generic]
+    if not likely_names:
+        return True
+    normalized_question = normalize_text(question)
+    compact_question = normalized_question.replace(" ", "")
+    for chunk in chunks:
+        signature = medicine_signature(str(chunk.get("medicine_name") or ""))
+        normalized_name = str(signature["normalized_name"])
+        if normalized_name and normalized_name in normalized_question:
+            return True
+        brand = str(signature["brand"])
+        if not brand:
+            continue
+        if brand in normalized_question or brand.replace(" ", "") in compact_question:
+            return True
+        brand_token = brand.split()[-1]
+        for token in likely_names:
+            if token == brand_token or token.startswith(brand_token):
+                return True
+            if len(brand_token) >= 4 and len(token) >= 4:
+                from difflib import SequenceMatcher
+
+                if SequenceMatcher(None, token, brand_token).ratio() >= 0.8:
+                    return True
+    return False
 
 
 def _source_items(source_text: str) -> list[str]:
     """Turn noisy PDF lines into readable, bounded source-backed bullets."""
 
-    ignored_fragments = (
+    ignored_prefixes = (
         "belge doğrulama kodu",
         "belge takip adresi",
-        "yan etkilerin raporlanması",
         "www.titck.gov.tr",
+    )
+    ignored_lines = (
+        "yan etkilerin raporlanması",
         "tüm ilaçlar gibi",
         "yan etkiler aşağıdaki kategorilerde",
     )
@@ -610,7 +612,9 @@ def _source_items(source_text: str) -> list[str]:
         if not line:
             continue
         lowered = line.casefold()
-        if page_number.fullmatch(line) or any(part in lowered for part in ignored_fragments):
+        if page_number.fullmatch(line) or any(
+            lowered.startswith(part) for part in ignored_prefixes
+        ) or any(lowered.strip(" .:") == part for part in ignored_lines):
             continue
         starts_item = bullet.match(line) is not None
         cleaned = bullet.sub("", line).strip()
@@ -626,12 +630,22 @@ def _source_items(source_text: str) -> list[str]:
     if current:
         items.append(current)
 
+    items = [
+        item
+        for item in items
+        if len(item) >= 3 and not re.fullmatch(r"\d+\s*-?", item)
+    ]
     if not items:
         compact = " ".join(
             " ".join(line.split())
             for line in source_text.splitlines()
             if line.strip()
-            and not any(part in line.casefold() for part in ignored_fragments)
+            and not any(
+                line.casefold().startswith(part) for part in ignored_prefixes
+            )
+            and not any(
+                line.casefold().strip(" .:") == part for part in ignored_lines
+            )
         )
         sentences = re.split(r"(?<=[.!?])\s+", compact)
         items = [sentence.strip() for sentence in sentences if sentence.strip()]

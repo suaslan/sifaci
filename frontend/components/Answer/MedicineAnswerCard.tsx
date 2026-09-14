@@ -76,10 +76,13 @@ export function MedicineAnswerCard({
   const reducedMotion = Boolean(useReducedMotion());
   const suggestions = result?.suggestions ?? [];
   const hasSources = Boolean(result?.sources.length);
+  const needsProductSelection = Boolean(
+    result && /birden fazla ürün formu/i.test(result.answer),
+  );
   const isEmptyResult = Boolean(
     result &&
       result.sources.length === 0 &&
-      /(bulunamadı|henüz .*işlenmemiş)/i.test(result.answer),
+      /(bulunamadı|henüz .*işlenmemiş|birden fazla ürün formu)/i.test(result.answer),
   );
   const responseSeconds = responseTimeMs == null ? null : (responseTimeMs / 1_000).toFixed(1);
 
@@ -124,7 +127,11 @@ export function MedicineAnswerCard({
             }`}
           >
             {hasSources ? <CheckCircle2 className="h-4 w-4" aria-hidden="true" /> : <SearchX className="h-4 w-4" aria-hidden="true" />}
-            {hasSources ? "Güvenilirlik: Kaynak doğrulandı" : "Belge eşleşmesi yok"}
+            {hasSources
+              ? "Güvenilirlik: Kaynak doğrulandı"
+              : needsProductSelection
+                ? "Ürün seçimi gerekli"
+                : "Belge eşleşmesi yok"}
           </span>
         )}
       </div>
@@ -165,7 +172,7 @@ export function MedicineAnswerCard({
             <div className="border-t border-red-950/10 px-5 py-5 sm:px-7">
               <div className="flex items-center gap-2 text-xs font-black text-stone-900">
                 <Search className="h-4 w-4 text-red-700" aria-hidden="true" strokeWidth={2} />
-                En yakın alternatif eşleşmeler
+                {needsProductSelection ? "Uygun ürün formunu seçin" : "En yakın alternatif eşleşmeler"}
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
                 {suggestions.slice(0, 5).map((suggestion) => (

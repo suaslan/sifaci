@@ -73,6 +73,22 @@ def test_brand_alias_matches_all_strength_variants(tmp_path):
     }
 
 
+def test_hyphenated_brand_matches_query_without_hyphen(tmp_path):
+    database_path = tmp_path / "hyphenated-aliases.db"
+    insert_medicine("A-FERİN 300 MG KAPSÜL", database_path=database_path)
+    insert_medicine("A-FERİN FORTE 650 MG TABLET", database_path=database_path)
+
+    matches = find_candidate_medicines(
+        "AFERİN nasıl kullanılır?",
+        database_path=database_path,
+    )
+
+    assert {match["medicine_name"] for match in matches} == {
+        "A-FERİN 300 MG KAPSÜL",
+        "A-FERİN FORTE 650 MG TABLET",
+    }
+
+
 def test_leaflet_parser_keeps_sections_separate():
     raw_text = """
 1. TEST nedir ve ne için kullanılır?
@@ -100,3 +116,41 @@ Baş ağrısı.
     assert "serious_side_effects" in chunk_types
     assert "common_side_effects" in chunk_types
     assert "storage" in chunk_types
+
+
+def test_leaflet_parser_handles_spaced_numbering_and_nested_kt_topics():
+    raw_text = """
+4. 1   Terapötik endikasyonlar
+Kayıtlı endikasyon metni.
+4．2. Pozoloji ve uygulama şekli
+Günde iki kez uygulanır.
+
+Hamilelikte kullanım
+Tedavi sırasında doktorunuza danışınız.
+
+Emzirme döneminde kullanım
+Anne sütü hakkında kaynak bilgisi.
+
+Araç ve makine kullanımı
+Araç kullanırken dikkat edilmelidir.
+
+Kullanmanız gerekenden daha fazlasını kullandıysanız
+Doktorunuza başvurunuz.
+
+Kullanmayı unutursanız
+Çift doz almayınız.
+"""
+
+    kub_sections = parse_leaflet_sections(raw_text, "KUB")
+    kt_sections = parse_leaflet_sections(raw_text, "KT")
+
+    kub_types = {section["chunk_type"] for section in kub_sections}
+    kt_types = {section["chunk_type"] for section in kt_sections}
+
+    assert "indications" in kub_types
+    assert "dosage" in kub_types
+    assert "pregnancy" in kt_types
+    assert "breastfeeding" in kt_types
+    assert "driving" in kt_types
+    assert "overdose" in kt_types
+    assert "missed_dose" in kt_types

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import requests
+
 from app import split_rag_response
 from src.database import get_chunks, get_database_stats
 from src.ingestion import ingest_directory
@@ -76,7 +78,7 @@ def test_json_to_streamlit_response_pipeline(tmp_path):
     def grounded_chat(messages):
         context = messages[1]["content"]
         assert "[KAYNAK 1]" in context
-        assert "Kategori: side_effects" in context
+        assert "Kategori: common_side_effects" in context
         assert "Baş ağrısı görülebilir." in context
         return "Kayıtlı kaynakta baş ağrısı yan etki olarak belirtilmiştir."
 
@@ -94,3 +96,48 @@ def test_json_to_streamlit_response_pipeline(tmp_path):
     assert trace["query_embedding_created"] is True
     assert trace["model_called"] is True
     assert "[KAYNAK 1]" in str(trace["retrieved_context"])
+
+
+def test_prepared_local_answer_path_works_when_network_is_unavailable(
+    tmp_path, monkeypatch
+):
+    documents_dir = tmp_path / "offline-medicines"
+    documents_dir.mkdir()
+    database_path = tmp_path / "offline.db"
+    payload = {
+        "medicine_name": "ÇEVRİMDIŞI 10 mg tablet",
+        "common_side_effects": "Bulantı görülebilir.",
+        "source": {"name": "TİTCK ÇEVRİMDIŞI KT", "reference": "KT-OFFLINE"},
+    }
+    (documents_dir / "offline.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    ingest_directory(
+        documents_dir,
+        database_path=database_path,
+        embedding_function=_deterministic_embedding,
+    )
+
+    def network_disabled(*_args, **_kwargs):
+        raise AssertionError("answer generation attempted a network request")
+
+    monkeypatch.setattr(requests.sessions.Session, "request", network_disabled)
+
+    def retrieve(query: str, top_k: int = 5, debug_trace=None):
+        return get_top_chunks(
+            query,
+            top_k=top_k,
+            database_path=database_path,
+            embedding_function=_deterministic_embedding,
+            debug_trace=debug_trace,
+        )
+
+    answer = answer_query(
+        "ÇEVRİMDIŞI ilacının yan etkileri nelerdir?",
+        retrieval_function=retrieve,
+        chat_function=lambda _: "Kaynağa göre bulantı görülebilir.",
+    )
+
+    assert "bulantı" in answer.casefold()
+    assert "TİTCK ÇEVRİMDIŞI KT" in answer
+    assert answer.endswith(DISCLAIMER)

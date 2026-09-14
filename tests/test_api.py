@@ -10,6 +10,16 @@ def _ready_database_stats():
     return {"medicine_count": 1, "chunk_count": 1}
 
 
+def _ready_readiness_stats():
+    return {
+        "catalog_medicine_count": 37_824,
+        "ready_medicine_count": 218,
+        "chunk_count": 1_760,
+        "embedded_chunk_count": 1_760,
+        "fts_chunk_count": 1_760,
+    }
+
+
 def _test_client(monkeypatch):
     """Create an API client without depending on the developer's local database."""
 
@@ -40,6 +50,20 @@ def test_answer_endpoint_returns_structured_rag_response(monkeypatch):
     }
 
 
+def test_chat_endpoint_accepts_message_and_returns_detected_medicine(monkeypatch):
+    def answer(_question, *, debug_trace):
+        debug_trace["top_chunks"] = [{"medicine_name": "PAROL 500 MG TABLET"}]
+        return f"Kaynaklı cevap.\n\nKaynaklar: TİTCK KT\n\n{DISCLAIMER}"
+
+    monkeypatch.setattr(api, "answer_query", answer)
+    with _test_client(monkeypatch) as client:
+        response = client.post("/api/chat", json={"message": "Parol nedir?"})
+
+    assert response.status_code == 200
+    assert response.json()["medicine"] == "PAROL 500 MG TABLET"
+    assert response.json()["sources"] == ["TİTCK KT"]
+
+
 def test_answer_endpoint_rejects_blank_question(monkeypatch):
     with _test_client(monkeypatch) as client:
         response = client.post("/answer", json={"question": "   "})
@@ -61,15 +85,18 @@ def test_answer_endpoint_hides_internal_errors(monkeypatch):
 
 
 def test_health_endpoint_returns_database_and_model_status(monkeypatch):
-    monkeypatch.setattr(api, "get_database_stats", _ready_database_stats)
+    monkeypatch.setattr(api, "get_readiness_stats", _ready_readiness_stats)
     with _test_client(monkeypatch) as client:
         response = client.get("/health")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
-    assert isinstance(payload["medicine_count"], int)
+    assert payload["catalog_medicine_count"] == 37_824
+    assert payload["ready_medicine_count"] == 218
     assert isinstance(payload["chunk_count"], int)
+    assert payload["embedded_chunk_count"] == 1_760
+    assert "Foundry Local" in payload["llm"]
     assert payload["llm"]
     assert payload["embedding_model"]
     assert "medicine_names" not in payload

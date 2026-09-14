@@ -10,7 +10,7 @@ from src.database import (
     find_duplicate_database_paths,
     get_chunks,
     get_database_stats,
-    get_medicine_names,
+    get_readiness_stats,
 )
 from src.ingestion import discover_medicine_files
 from src.retrieval import get_top_chunks
@@ -34,6 +34,7 @@ def main() -> None:
     medicine_directory = Path(MEDICINES_DIR).resolve()
     duplicate_candidates = find_duplicate_database_paths()
     stats = get_database_stats()
+    readiness = get_readiness_stats()
     chunks = get_chunks()
     embedded_chunks = sum(bool(chunk.get("embedding")) for chunk in chunks)
 
@@ -41,10 +42,11 @@ def main() -> None:
     print(f"Medicines folder: {medicine_directory}")
     print(f"JSON/CSV files: {len(discover_medicine_files())}")
     print(f"Medicines: {stats['medicine_count']}")
+    print(f"READY medicines: {readiness['ready_medicine_count']}")
     print(f"Chunks: {stats['chunk_count']}")
     print(f"Embedded chunks: {embedded_chunks}")
+    print(f"FTS rows: {readiness['fts_chunk_count']}")
     print(f"Embedding model: {EMBEDDING_MODEL_NAME}")
-    print(f"Medicine names: {', '.join(get_medicine_names()) or 'NONE'}")
     print(
         "Duplicate databases: "
         + (", ".join(str(path) for path in duplicate_candidates) or "NONE")

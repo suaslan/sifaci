@@ -19,7 +19,7 @@ from config import (
     MAX_QUESTION_CHARS,
 )
 from src.database import (
-    get_database_stats,
+    get_readiness_stats,
     initialize_database,
     require_database_content,
 )
@@ -36,6 +36,7 @@ class AnswerRequest(BaseModel):
 
 class AnswerResponse(BaseModel):
     answer: str
+    medicine: str | None = None
     sources: list[str]
     disclaimer: str
     suggestions: list[str] = Field(default_factory=list, max_length=5)
@@ -43,10 +44,16 @@ class AnswerResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    medicine_count: int
+    catalog_medicine_count: int
+    ready_medicine_count: int
     chunk_count: int
+    embedded_chunk_count: int
     llm: str
     embedding_model: str
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
 
 
 @asynccontextmanager
@@ -72,19 +79,32 @@ app = FastAPI(
 
 @app.get("/health", response_model=HealthResponse)
 def health_check() -> HealthResponse:
-    stats = get_database_stats()
+    stats = get_readiness_stats()
     return HealthResponse(
         status="ok",
-        medicine_count=stats["medicine_count"],
+        catalog_medicine_count=stats["catalog_medicine_count"],
+        ready_medicine_count=stats["ready_medicine_count"],
         chunk_count=stats["chunk_count"],
-        llm=FOUNDRY_MODEL_ALIAS,
+        embedded_chunk_count=stats["embedded_chunk_count"],
+        llm=f"Microsoft Foundry Local: {FOUNDRY_MODEL_ALIAS}",
         embedding_model=EMBEDDING_MODEL_NAME,
     )
 
 
-@app.post("/answer", response_model=AnswerResponse)
+@app.post("/answer", response_model=AnswerResponse, response_model_exclude_none=True)
 def answer_medicine_question(payload: AnswerRequest) -> AnswerResponse:
-    question = payload.question.strip()
+    return _answer(payload.question)
+
+
+@app.post("/api/chat", response_model=AnswerResponse, response_model_exclude_none=True)
+def chat_medicine_question(payload: ChatRequest) -> AnswerResponse:
+    """Public RAG endpoint used by the frontend chat flow."""
+
+    return _answer(payload.message)
+
+
+def _answer(raw_question: str) -> AnswerResponse:
+    question = raw_question.strip()
     if not question:
         raise HTTPException(status_code=422, detail="Soru boş olamaz.")
 
@@ -96,8 +116,8 @@ def answer_medicine_question(payload: AnswerRequest) -> AnswerResponse:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Yanıt oluşturulamadı. Foundry Local modellerini ve "
-                "veritabanındaki embedding kayıtlarını kontrol edin."
+                "Yanıt oluşturulamadı. Foundry Local kayıtlarını ve "
+                "ilaç bilgi tabanını kontrol edin."
             ),
         ) from error
 
@@ -115,8 +135,18 @@ def answer_medicine_question(payload: AnswerRequest) -> AnswerResponse:
         if isinstance(raw_suggestions, list)
         else []
     )
+    top_chunks = debug_trace.get("top_chunks")
+    medicine = None
+    if isinstance(top_chunks, list) and top_chunks:
+        first_chunk = top_chunks[0]
+        if isinstance(first_chunk, dict):
+            medicine = str(first_chunk.get("medicine_name") or "").strip() or None
+    if medicine is None:
+        detected = debug_trace.get("detected_medicine")
+        medicine = str(detected).strip() if detected else None
     return AnswerResponse(
         answer=answer,
+        medicine=medicine,
         sources=parsed_sources,
         disclaimer=disclaimer,
         suggestions=suggestions,

@@ -11,25 +11,34 @@ from config import SYNC_CHUNK_MAX_CHARS, SYNC_CHUNK_MIN_CHARS
 
 
 _KT_HEADINGS = (
-    (r"^\s*1[.)]?\s+.*?nedir\s+ve\s+ne\s+için\s+kullanılır", "Ne için kullanılır?", "indications"),
-    (r"^\s*2[.)]?\s+.*?kullanmadan\s+önce", "Kullanmadan önce dikkat edilmesi gerekenler", "warnings"),
-    (r"^\s*3[.)]?\s+.*?nasıl\s+kullanılır", "Nasıl kullanılır?", "usage"),
-    (r"^\s*4[.)]?\s+olası\s+yan\s+etkiler", "Olası yan etkiler", "common_side_effects"),
-    (r"^\s*5[.)]?\s+.*?saklanması", "Saklanması", "storage"),
+    (r"^\s*1\s*[.):\-]?\s*(?:\r?\n\s*)?.{0,100}?nedir\s+ve\s+ne\s+için\s+kullanılır", "Ne için kullanılır?", "indications"),
+    (r"^\s*2\s*[.):\-]?\s*(?:\r?\n\s*)?.{0,100}?kullanmadan\s+önce", "Kullanmadan önce dikkat edilmesi gerekenler", "warnings"),
+    (r"^\s*3\s*[.):\-]?\s*(?:\r?\n\s*)?.{0,100}?nasıl\s+kullanılır", "Nasıl kullanılır?", "usage"),
+    (r"^\s*4\s*[.):\-]?\s*(?:\r?\n\s*)?olası\s+yan\s+etkiler", "Olası yan etkiler", "common_side_effects"),
+    (r"^\s*5\s*[.):\-]?\s*(?:\r?\n\s*)?.{0,100}?saklanması", "Saklanması", "storage"),
 )
 
 _KUB_HEADINGS = (
-    (r"^\s*2[.)]?\s+kalitatif", "Etkin madde", "active_ingredient"),
-    (r"^\s*4[.]1\s+terapötik\s+endikasyonlar", "Terapötik endikasyonlar", "indications"),
-    (r"^\s*4[.]2\s+pozoloji", "Pozoloji ve uygulama şekli", "dosage"),
-    (r"^\s*4[.]3\s+kontrendikasyonlar", "Kontrendikasyonlar", "contraindications"),
-    (r"^\s*4[.]4\s+özel\s+kullanım", "Özel kullanım uyarıları", "warnings"),
-    (r"^\s*4[.]5\s+diğer\s+tıbbi", "İlaç etkileşimleri", "interactions"),
-    (r"^\s*4[.]6\s+gebelik", "Gebelik ve emzirme", "pregnancy"),
-    (r"^\s*4[.]7\s+araç", "Araç ve makine kullanımı", "driving"),
-    (r"^\s*4[.]8\s+istenmeyen", "İstenmeyen etkiler", "common_side_effects"),
-    (r"^\s*4[.]9\s+doz\s+aşımı", "Doz aşımı", "overdose"),
-    (r"^\s*6[.]4\s+saklamaya", "Saklama koşulları", "storage"),
+    (r"^\s*2\s*[.):\-]?\s*(?:\r?\n\s*)?kalitatif", "Etkin madde", "active_ingredient"),
+    (r"^\s*4\s*[.．]?\s*1\s*[.):\-]?\s*(?:\r?\n\s*)?terapötik\s+endikasyonlar", "Terapötik endikasyonlar", "indications"),
+    (r"^\s*4\s*[.．]?\s*2\s*[.):\-]?\s*(?:\r?\n\s*)?pozoloji", "Pozoloji ve uygulama şekli", "dosage"),
+    (r"^\s*4\s*[.．]?\s*3\s*[.):\-]?\s*(?:\r?\n\s*)?kontrendikasyonlar", "Kontrendikasyonlar", "contraindications"),
+    (r"^\s*4\s*[.．]?\s*4\s*[.):\-]?\s*(?:\r?\n\s*)?özel\s+kullanım", "Özel kullanım uyarıları", "warnings"),
+    (r"^\s*4\s*[.．]?\s*5\s*[.):\-]?\s*(?:\r?\n\s*)?diğer\s+tıbbi", "İlaç etkileşimleri", "interactions"),
+    (r"^\s*4\s*[.．]?\s*6\s*[.):\-]?\s*(?:\r?\n\s*)?(?:gebelik|fertilite)", "Gebelik ve emzirme", "pregnancy"),
+    (r"^\s*4\s*[.．]?\s*7\s*[.):\-]?\s*(?:\r?\n\s*)?araç", "Araç ve makine kullanımı", "driving"),
+    (r"^\s*4\s*[.．]?\s*8\s*[.):\-]?\s*(?:\r?\n\s*)?istenmeyen", "İstenmeyen etkiler", "common_side_effects"),
+    (r"^\s*4\s*[.．]?\s*9\s*[.):\-]?\s*(?:\r?\n\s*)?doz\s+aşımı", "Doz aşımı", "overdose"),
+    (r"^\s*6\s*[.．]?\s*4\s*[.):\-]?\s*(?:\r?\n\s*)?saklamaya", "Saklama koşulları", "storage"),
+)
+
+_NESTED_HEADINGS = (
+    (r"^\s*(?:hamilelik|gebelik)(?:te|teki)?(?:\s+döneminde)?(?:\s+kullanım)?\s*$", "Gebelik", "pregnancy"),
+    (r"^\s*(?:emzirme(?:\s+döneminde)?(?:\s+kullanım)?|emzirirken)\s*$", "Emzirme", "breastfeeding"),
+    (r"^\s*araç\s+ve\s+makine\s+kullanımı\s*$", "Araç ve makine kullanımı", "driving"),
+    (r"^\s*.*kullanmanız\s+gerekenden\s+(?:daha\s+)?fazlasını.*$", "Doz aşımı", "overdose"),
+    (r"^\s*.*kullanmayı\s+unutursanız.*$", "Unutulan doz", "missed_dose"),
+    (r"^\s*.*tedavi.*(?:sonlandırıldığında|bırakırsanız).*$", "Tedavinin bırakılması", "stopping_treatment"),
 )
 
 
@@ -68,10 +77,14 @@ def parse_leaflet_sections(raw_text: str, document_type: str) -> list[dict[str, 
         end = matches[index + 1][0] if index + 1 < len(matches) else len(text)
         body = text[start:end].strip()
         if body:
-            sections.extend(_split_side_effect_section(section, chunk_type, body))
+            split_sections = _split_side_effect_section(section, chunk_type, body)
+            sections.extend(split_sections)
+            for split_section in split_sections:
+                sections.extend(_nested_semantic_sections(split_section["text"]))
 
     if not sections and text:
         sections.append({"section": "Belge metni", "chunk_type": "general", "text": text})
+        sections.extend(_nested_semantic_sections(text))
 
     # Leaflets usually repeat all headings in a table of contents. Keep the
     # longest occurrence for each semantic section so TOC fragments do not
@@ -142,6 +155,23 @@ def _split_side_effect_section(
         )
     if common:
         result.append({"section": section, "chunk_type": chunk_type, "text": common})
+    return result
+
+
+def _nested_semantic_sections(body: str) -> list[dict[str, str]]:
+    """Preserve common KT subheadings as dedicated semantic evidence."""
+
+    matches: list[tuple[int, int, str, str]] = []
+    for pattern, section, chunk_type in _NESTED_HEADINGS:
+        for match in re.finditer(pattern, body, flags=re.IGNORECASE | re.MULTILINE):
+            matches.append((match.start(), match.end(), section, chunk_type))
+    matches.sort(key=lambda item: item[0])
+    result: list[dict[str, str]] = []
+    for index, (start, _, section, chunk_type) in enumerate(matches):
+        end = matches[index + 1][0] if index + 1 < len(matches) else len(body)
+        text = body[start:end].strip()
+        if text:
+            result.append({"section": section, "chunk_type": chunk_type, "text": text})
     return result
 
 

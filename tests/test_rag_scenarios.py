@@ -319,12 +319,12 @@ def test_source_information_is_shown_at_answer_end(scenario_database):
     answer = answer_query(
         scenario.input,
         retrieval_function=retrieval,
-        chat_function=lambda _: "Kayıtlı yan etki cevabı.",
+        chat_function=lambda _: "Baş ağrısı ve bulantı görülebilir.",
     )
 
     source_position = answer.rindex("Kaynaklar: TİTCK ALFA KT")
     disclaimer_position = answer.rindex(DISCLAIMER)
-    assert source_position > answer.index("Kayıtlı yan etki cevabı.")
+    assert source_position > answer.index("Baş ağrısı ve bulantı görülebilir.")
     assert disclaimer_position > source_position
     assert answer.endswith(DISCLAIMER)
 
@@ -339,5 +339,5 @@ def test_model_cannot_add_information_outside_context(scenario_database):
         chat_function=lambda _: "Bu ilaçtan günde 50 mg kullanılmalıdır.",
     )
 
-    assert answer.startswith(MISSING_INFORMATION_RESPONSE)
+    assert "Baş ağrısı ve bulantı görülebilir." in answer
     assert "50 mg" not in answer

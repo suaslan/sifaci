@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent
+
 
 def _environment_flag(name: str, default: bool = False) -> bool:
     fallback = "true" if default else "false"
@@ -63,7 +65,6 @@ API_PORT = _environment_int("API_PORT", 8_000, minimum=1)
 
 
 # Proje yolları
-BASE_DIR = Path(__file__).resolve().parent
 _DEFAULT_STORAGE_ROOT = Path("D:/SifaciAI") if os.name == "nt" else BASE_DIR / ".sifaci"
 STORAGE_ROOT = (
     _DEFAULT_STORAGE_ROOT
@@ -169,7 +170,6 @@ FOUNDRY_PREPARE_EXECUTION_PROVIDERS = _environment_flag(
 )
 FOUNDRY_TEST_PROMPT = "Merhaba. Sadece 'model çalışıyor' yaz."
 
-
 # Ingestion ve retrieval
 MAX_CHUNK_CHARS = _environment_int("MAX_CHUNK_CHARS", 1_200, minimum=100)
 RETRIEVAL_TOP_K = _environment_int("RETRIEVAL_TOP_K", 5, minimum=1)
@@ -252,7 +252,9 @@ ILACABAK_PARSER_VERSION = "1"
 
 
 # RAG güvenliği ve çıktı biçimi
-MISSING_INFORMATION_RESPONSE = "İlgili bilgi belgelerde bulunamadı."
+MISSING_INFORMATION_RESPONSE = (
+    "Bu soruyu yanıtlamak için bilgi tabanında yeterli kaynak bulunamadı."
+)
 CATALOG_NOT_FOUND_RESPONSE = "Bu ilaç ürün kataloğunda bulunamadı."
 SAFETY_DISCLAIMER = (
     "Bu sistem yalnızca kayıtlı ilaç bilgilerinin görüntülenmesi amacıyla "
@@ -277,4 +279,7 @@ ZORUNLU KURALLAR:
 12. Yanıtın sonuna kaynak listesi, "Kullanılan kaynaklar" başlığı veya genel uyarı ekleme; bunlar uygulama tarafından eklenecek.
 13. HTML, XML, SVG, ikon kodu veya arayüz markup'ı üretme; yalnızca düz metin yanıtla.
 14. İlaç kataloğunu veya uzun ilaç adı listelerini asla yanıta dökme.
+15. İlaç adı, etkin madde, kullanım, yan etki, kontrendikasyon ve etkileşim konularında context dışına çıkma.
+16. Tanı koyma ve kişiye özel ilaç veya doz önerme.
+17. Mümkün olduğunda kullandığın kaynak bölümünü kısa biçimde cevapta belirt.
 """

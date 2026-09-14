@@ -53,6 +53,7 @@ from src.database import (
     upsert_products,
 )
 from src.medicine_names import normalize_medicine_name
+from src.medicine_resolution import resolve_canonical_medicine
 from src.titck_pipeline import run_document_pipeline
 
 
@@ -396,11 +397,20 @@ def synchronize(
             marked = mark_unseen_titck_products(normalized_seen)
             print(f"En güncel listede görünmeyen olarak işaretlenen ürün: {marked}")
 
+        all_medicines = get_all_medicines()
+        canonical_medicines = [
+            item
+            for item in all_medicines
+            if "ruhsatli beseri tibbi urunler listesi"
+            in normalize_medicine_name(str(item.get("source_name") or ""))
+        ]
+        if not canonical_medicines:
+            canonical_medicines = all_medicines
         medicine_index = {
             str(item.get("normalized_name") or normalize_medicine_name(item["medicine_name"])): int(
                 item["medicine_id"]
             )
-            for item in get_all_medicines()
+            for item in canonical_medicines
         }
         cached_status = get_pipeline_status()
         discovery_snapshot = get_sync_state("titck_url_discovery_complete")
@@ -416,13 +426,19 @@ def synchronize(
                 set_sync_state("titck_discovery_offset", "0")
             start_offset = int(get_sync_state("titck_discovery_offset") or 0)
             discovered = start_offset
-            catalog_result = {"inserted": 0, "updated": 0, "duplicates": 0}
+            catalog_result = {"inserted": 0, "updated": 0, "duplicates": 0, "pending": 0}
             for records in client.kubkt_record_batches(
                 start_offset=start_offset,
                 limit=limit,
             ):
                 page_result = register_document_catalog(
-                    _build_document_catalog(records, medicine_index, counters, errors)
+                    _build_document_catalog(
+                        records,
+                        medicine_index,
+                        canonical_medicines,
+                        counters,
+                        errors,
+                    )
                 )
                 for key in catalog_result:
                     catalog_result[key] += page_result[key]
@@ -432,7 +448,8 @@ def synchronize(
                 "Belge kataloğu: "
                 f"{catalog_result['inserted']} yeni, "
                 f"{catalog_result['updated']} güncel, "
-                f"{catalog_result['duplicates']} değişmemiş."
+                f"{catalog_result['duplicates']} değişmemiş, "
+                f"{catalog_result['pending']} belirsiz eşleşme beklemede."
             )
             if limit is None:
                 set_sync_state("titck_url_discovery_complete", str(discovered))
@@ -506,6 +523,7 @@ def synchronize(
 def _build_document_catalog(
     records: list[dict[str, Any]],
     medicine_index: dict[str, int],
+    canonical_medicines: list[dict[str, Any]],
     counters: dict[str, int],
     errors: list[str],
 ) -> list[dict[str, Any]]:
@@ -521,27 +539,47 @@ def _build_document_catalog(
             if not product_name:
                 _record_error(errors, counters, "KÜB/KT kaydında ilaç adı yok.")
                 continue
-            normalized_name = normalize_medicine_name(product_name)
-            medicine_id = medicine_index.get(normalized_name)
-            if medicine_id is None:
-                try:
-                    medicine_id, _ = upsert_product(
-                        {
-                            "product_name": product_name,
-                            "active_ingredient": _plain_text(record.get("element")),
-                            "company": _plain_text(record.get("firmName")),
-                            "source": "TİTCK",
-                            "source_name": "TİTCK KÜB/KT Listesi",
-                            "source_reference": TITCK_KUBKT_PAGE_URL,
-                        }
-                    )
-                    medicine_index[normalized_name] = medicine_id
-                except Exception as error:
-                    _record_error(errors, counters, f"KÜB/KT ürünü {product_name}: {error}")
-                    continue
             document_url = _document_url(record.get(path_key))
             if not document_url:
                 continue
+            active_ingredient = _plain_text(record.get("element"))
+            company = _plain_text(record.get("firmName"))
+            normalized_name = normalize_medicine_name(product_name)
+            medicine_id = medicine_index.get(normalized_name)
+            if medicine_id is None:
+                resolution = resolve_canonical_medicine(
+                    {
+                        "product_name": product_name,
+                        "active_ingredient": active_ingredient,
+                        "company": company,
+                    },
+                    canonical_medicines,
+                )
+                if resolution["status"] == "matched":
+                    medicine_id = int(resolution["medicine_id"])
+                    medicine_index[normalized_name] = medicine_id
+                else:
+                    reason = str(resolution["reason"])
+                    _record_error(
+                        errors,
+                        counters,
+                        f"KÜB/KT eşleşmesi beklemede: {product_name} ({reason}) {document_url}",
+                    )
+                    catalog.append(
+                        {
+                            "medicine_id": None,
+                            "product_name": product_name,
+                            "active_ingredient": active_ingredient,
+                            "company": company,
+                            "document_type": document_type,
+                            "document_url": document_url,
+                            "approval_date": _plain_text(record.get(date_key)),
+                            "source": "TİTCK",
+                            "link_reason": reason,
+                            "link_candidates": resolution.get("candidates") or [],
+                        }
+                    )
+                    continue
             catalog.append(
                 {
                     "medicine_id": medicine_id,

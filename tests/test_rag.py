@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from config import MISSING_INFORMATION_RESPONSE
+from src.foundry_client import FoundryLocalError
 from src.rag import DISCLAIMER, answer_query
 
 
@@ -46,7 +48,7 @@ def test_missing_retrieval_does_not_call_chat():
         chat_function=fail_chat,
     )
 
-    assert "İlgili bilgi belgelerde bulunamadı." in answer
+    assert MISSING_INFORMATION_RESPONSE in answer
     assert "Kaynaklar: Bulunamadı" in answer
     assert answer.endswith(DISCLAIMER)
 
@@ -69,12 +71,13 @@ def test_personalized_dose_is_blocked_before_chat():
 
 def test_unsupported_generated_quantity_is_rejected():
     answer = answer_query(
-        "Alfa nasıl kullanılır?",
+        "Alfa doz bilgisi nedir?",
         retrieval_function=lambda *_, **__: SOURCES,
         chat_function=lambda _: "Günde 50 mg kullanılmalıdır.",
     )
 
-    assert answer.startswith("İlgili bilgi belgelerde bulunamadı.")
+    assert "Genel doz metni kaynakta bulunur." in answer
+    assert "50 mg" not in answer
 
 
 def test_false_missing_model_answer_falls_back_to_retrieved_side_effects():
@@ -123,7 +126,7 @@ def test_unknown_medicine_does_not_call_chat_or_cite_wrong_source():
         chat_function=fail_chat,
     )
 
-    assert answer.startswith("İlgili bilgi belgelerde bulunamadı.")
+    assert answer.startswith(MISSING_INFORMATION_RESPONSE)
     assert "Kaynaklar: Bulunamadı" in answer
     assert "TİTCK KÜB" not in answer
 
@@ -138,6 +141,98 @@ def test_fuzzy_registered_name_still_reaches_chat():
     assert "Kaynakta genel doz bilgisi vardır." in answer
 
 
+def test_hyphenated_brand_reaches_chat_when_source_matches():
+    chunks = [
+        {
+            **SOURCES[0],
+            "medicine_name": "A-FERİN 300 MG KAPSÜL",
+            "chunk_type": "usage",
+            "chunk_text": "İlaç: A-FERİN 300 MG KAPSÜL\nKategori: usage\nTok karnına alınır.",
+        }
+    ]
+
+    answer = answer_query(
+        "A-FERİN 300 MG KAPSÜL nasıl kullanılır?",
+        retrieval_function=lambda *_, **__: chunks,
+        chat_function=lambda _: "Kaynağa göre tok karnına alınır.",
+    )
+
+    assert "Kaynağa göre tok karnına alınır." in answer
+
+
+def test_ambiguous_product_family_requests_exact_form_without_calling_chat():
+    trace = {}
+
+    def retrieval(_query, top_k, debug_trace):
+        debug_trace.update(
+            {
+                "retrieval_state": "medicine_ambiguous",
+                "fallback_reason": "medicine_ambiguous",
+                "similar_medicines": [
+                    "A-FERİN ŞURUP nasıl kullanılır?",
+                    "A-FERİN KAPSÜL nasıl kullanılır?",
+                ],
+            }
+        )
+        return []
+
+    answer = answer_query(
+        "AFERİN nasıl kullanılır?",
+        retrieval_function=retrieval,
+        chat_function=lambda _: (_ for _ in ()).throw(AssertionError("LLM called")),
+        debug_trace=trace,
+    )
+
+    assert answer.startswith("Birden fazla ürün formu bulundu.")
+    assert trace["model_called"] is False
+
+
+def test_system_prompt_echo_is_replaced_with_grounded_indication():
+    chunks = [
+        {
+            **SOURCES[0],
+            "chunk_type": "indications",
+            "chunk_text": "İlaç: ALFA 10 mg\nKategori: indications\nKas ağrılarında kullanılır.",
+        }
+    ]
+
+    answer = answer_query(
+        "Alfa ne için kullanılır?",
+        retrieval_function=lambda *_, **__: chunks,
+        chat_function=lambda _: "İlgili bir ilaç bilgi asistanısın.",
+    )
+
+    assert "Kullanım alanı:" in answer
+    assert "Kas ağrılarında kullanılır." in answer
+    assert "ilaç bilgi asistanısın" not in answer
+
+
+def test_ungrounded_model_filler_is_replaced_with_usage_source():
+    chunks = [
+        {
+            **SOURCES[0],
+            "medicine_name": "A-FERİN 300 MG KAPSÜL",
+            "chunk_type": "usage",
+            "chunk_text": (
+                "İlaç: A-FERİN 300 MG KAPSÜL\nKategori: usage\n"
+                "Günde 3 kez 1 kapsül, yemeklerden sonra bol su ile alınır."
+            ),
+        }
+    ]
+
+    answer = answer_query(
+        "A-FERİN 300 MG KAPSÜL nasıl kullanılır?",
+        retrieval_function=lambda *_, **__: chunks,
+        chat_function=lambda _: (
+            "İlgili bilgi belge doğruluşuyor. Kaynakta veri olarak aktarılır."
+        ),
+    )
+
+    assert "Genel kullanım bilgisi:" in answer
+    assert "Günde 3 kez 1 kapsül" in answer
+    assert "doğruluşuyor" not in answer
+
+
 def test_chat_failure_uses_exact_retrieved_field_fallback():
     chunks = [
         {
@@ -148,7 +243,7 @@ def test_chat_failure_uses_exact_retrieved_field_fallback():
     ]
 
     def fail_chat(_):
-        raise RuntimeError("local model allocation failed")
+        raise FoundryLocalError("local model allocation failed")
 
     answer = answer_query(
         "Alfa ilacının yan etkileri nelerdir?",
@@ -158,6 +253,29 @@ def test_chat_failure_uses_exact_retrieved_field_fallback():
 
     assert "Kaynakta bildirilen yan etkiler:" in answer
     assert "- Bulantı" in answer
+
+
+def test_chat_failure_falls_back_when_plain_text_ends_with_pdf_page_marker():
+    chunks = [
+        {
+            **SOURCES[0],
+            "chunk_type": "storage",
+            "chunk_text": (
+                "İlaç: ALFA 10 mg\nBölüm: Saklanması\n"
+                "Yan etkilerin raporlanması hakkında genel açıklama. "
+                "25°C'nin altındaki oda sıcaklığında saklayınız.\n-7-"
+            ),
+        }
+    ]
+
+    answer = answer_query(
+        "Alfa nasıl saklanır?",
+        retrieval_function=lambda *_, **__: chunks,
+        chat_function=lambda _: (_ for _ in ()).throw(RuntimeError("model failed")),
+    )
+
+    assert "Saklama koşulları:" in answer
+    assert "25°C" in answer
 
 
 def test_unhelpful_model_sentence_is_replaced_with_grounded_answer():

@@ -140,7 +140,7 @@ export function Hero() {
             result={answer}
             error={error}
             responseTimeMs={responseTimeMs}
-            onSuggestionSelect={(suggestion) => handleSearch(`${suggestion} hakkında bilgi verir misin?`)}
+            onSuggestionSelect={handleSearch}
           />
         </motion.div>
       </div>

@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import math
 import re
-import unicodedata
 from collections.abc import Callable, MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
-
-from rapidfuzz import fuzz
 
 from config import (
     DATABASE_PATH,
@@ -24,9 +21,20 @@ from src.database import (
     get_chunks,
     get_dosage_rules,
     get_medicine_data_status,
+    get_medicines_by_ids,
+    search_medicine_chunks_fts,
 )
 from src.dosage_parser import extract_query_age
 from src.embeddings import generate_embedding
+from src.intents import (
+    INTENT_CHUNK_TYPES,
+    SUGGESTION_SUFFIXES,
+    chunk_supports_intent,
+    detect_intent,
+    intent_search_text,
+    normalize_text,
+)
+from src.medicine_resolution import medicine_signature
 
 
 _GENERIC_NAME_WORDS = {
@@ -41,41 +49,6 @@ _GENERIC_NAME_WORDS = {
     "surup",
     "şurup",
     "tablet",
-}
-
-_INTENT_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (
-        "SIDE_EFFECTS",
-        (
-            "yan etki",
-            "yan etkiler",
-            "yan etkisi",
-            "yan etkileri",
-            "istenmeyen etki",
-            "istenmeyen etkiler",
-            "advers etkiler",
-        ),
-    ),
-    ("FREQUENCY", ("günde kaç", "kaç kez", "kullanım sıklığı", "sıklık")),
-    ("DOSAGE", ("doz", "pozoloji", "kaç mg")),
-    ("INDICATION", ("ne için", "endikasyon", "hangi durumda")),
-    ("ACTIVE_INGREDIENT", ("etken madde", "etkin madde", "aktif madde")),
-    ("CONTRAINDICATION", ("kontrendikasyon", "kimler kullanmamalı")),
-    ("INTERACTION", ("etkileşim", "birlikte kullan")),
-    ("WARNING", ("uyarı", "dikkat")),
-    ("STORAGE", ("saklama", "nasıl saklan")),
-)
-
-_INTENT_CHUNK_TYPES = {
-    "SIDE_EFFECTS": {"common_side_effects", "side_effects", "serious_side_effects"},
-    "FREQUENCY": {"frequency", "usage", "dosage"},
-    "DOSAGE": {"dosage", "usage", "frequency"},
-    "INDICATION": {"indications"},
-    "ACTIVE_INGREDIENT": {"active_ingredient"},
-    "CONTRAINDICATION": {"contraindications"},
-    "INTERACTION": {"interactions"},
-    "WARNING": {"warnings", "serious_side_effects"},
-    "STORAGE": {"storage"},
 }
 
 _GENERIC_QUERY_WORDS = {
@@ -139,7 +112,7 @@ def get_top_chunks(
                 "medicine_id": item["medicine_id"],
                 "medicine_name": item["medicine_name"],
                 "alias": item["alias"],
-                "name_score": item["name_score"],
+                    "name_score": item.get("name_score", 0.0),
                 "match_type": item.get("match_type"),
                 "matched_alias": item.get("matched_alias") or item.get("alias"),
             }
@@ -153,30 +126,95 @@ def get_top_chunks(
 
     if not candidates:
         if debug_trace is not None:
-            suggestions = find_candidate_medicines(
+            suggestion_candidates = find_candidate_medicines(
                 query,
-                limit=5,
+                limit=MEDICINE_CANDIDATE_LIMIT,
                 minimum_fuzzy_score=0.48,
                 database_path=database_path,
             )
-            debug_trace["similar_medicines"] = [
-                str(item["medicine_name"]) for item in suggestions[:5]
-            ]
+            suggestion_chunks = (
+                get_chunks(
+                    medicine_ids=[
+                        int(item["medicine_id"]) for item in suggestion_candidates
+                    ],
+                    database_path=database_path,
+                )
+                if suggestion_candidates
+                else []
+            )
+            processed_suggestions = _processed_candidates(
+                suggestion_candidates, suggestion_chunks
+            )
+            debug_trace["similar_medicines"] = _suggestion_queries(
+                processed_suggestions, intent=intent
+            )
             debug_trace["retrieval_state"] = "medicine_not_found"
             debug_trace["fallback_reason"] = "medicine_not_found"
         return []
 
-    data_status = get_medicine_data_status(matched_ids, database_path=database_path)
+    if len({int(item["medicine_id"]) for item in candidates}) > 1:
+        same_brand_candidates = _same_commercial_brand_candidates(candidates)
+        if same_brand_candidates:
+            candidates = same_brand_candidates
+            matched_ids = [int(item["medicine_id"]) for item in candidates]
+            if debug_trace is not None:
+                debug_trace["matched_medicine_ids"] = matched_ids
+
+    if len({int(item["medicine_id"]) for item in candidates}) > 1:
+        narrowed_candidates = _narrow_candidates_by_explicit_product(query, candidates)
+        if narrowed_candidates:
+            candidates = narrowed_candidates
+            matched_ids = [int(item["medicine_id"]) for item in candidates]
+            if debug_trace is not None:
+                debug_trace["matched_medicine_ids"] = matched_ids
+
     database_chunks = get_chunks(
         medicine_ids=matched_ids,
         database_path=database_path,
     )
+
+    # A short brand may represent several strengths or dosage forms. Never mix
+    # their evidence in one medical answer. Prefer the sole processed match, or
+    # ask the user to select an exact processed product when several remain.
+    if len({int(item["medicine_id"]) for item in candidates}) > 1:
+        processed_candidates = _processed_candidates(candidates, database_chunks)
+        if len(processed_candidates) > 1:
+            if debug_trace is not None:
+                debug_trace["similar_medicines"] = _suggestion_queries(
+                    processed_candidates, intent=intent
+                )
+                debug_trace["retrieval_state"] = "medicine_ambiguous"
+                debug_trace["fallback_reason"] = "medicine_ambiguous"
+                debug_trace["database_chunk_count"] = len(database_chunks)
+            return []
+        if len(processed_candidates) == 1:
+            candidates = processed_candidates
+            matched_ids = [int(processed_candidates[0]["medicine_id"])]
+            database_chunks = [
+                chunk
+                for chunk in database_chunks
+                if int(chunk.get("medicine_id") or -1) == matched_ids[0]
+            ]
+            if debug_trace is not None:
+                debug_trace["selected_medicine_id"] = matched_ids[0]
+                debug_trace["detected_medicine"] = str(
+                    processed_candidates[0]["medicine_name"]
+                )
+
+    data_status = get_medicine_data_status(matched_ids, database_path=database_path)
     if debug_trace is not None:
         debug_trace["database_chunk_count"] = len(database_chunks)
         debug_trace["medicine_data_status"] = data_status
 
-    structured_results: list[dict[str, Any]] = []
-    if candidates and intent in {"DOSAGE", "FREQUENCY"}:
+    structured_results = (
+        _structured_metadata_results(
+            get_medicines_by_ids(matched_ids, database_path=database_path),
+            intent=intent,
+        )
+        if candidates and all(candidate.get("match_type") for candidate in candidates)
+        else []
+    )
+    if candidates and intent in {"DOSAGE", "FREQUENCY", "USAGE"}:
         query_age = extract_query_age(query)
         dosage_rules = get_dosage_rules(
             [int(item["medicine_id"]) for item in candidates],
@@ -188,11 +226,15 @@ def get_top_chunks(
             int(item["medicine_id"]): str(item["medicine_name"])
             for item in candidates
         }
-        structured_results = _structured_rule_results(
-            dosage_rules,
-            names_by_id,
-            intent=intent,
-            top_k=top_k,
+        structured_results = _merge_results(
+            _structured_rule_results(
+                dosage_rules,
+                names_by_id,
+                intent=intent,
+                top_k=top_k,
+            ),
+            structured_results,
+            top_k,
         )
         if debug_trace is not None:
             debug_trace["query_age"] = (
@@ -209,16 +251,16 @@ def get_top_chunks(
                 for item in structured_results
             ]
 
-    intent_types = _INTENT_CHUNK_TYPES.get(intent, set())
-    filtered_chunks = (
-        [
-            chunk
-            for chunk in database_chunks
-            if str(chunk.get("chunk_type") or "") in intent_types
-        ]
-        if intent_types
-        else database_chunks
-    )
+    intent_types = set(INTENT_CHUNK_TYPES.get(intent, ()))
+    filtered_chunks = [
+        chunk
+        for chunk in database_chunks
+        if chunk_supports_intent(
+            str(chunk.get("chunk_type") or ""),
+            f"{chunk.get('section') or ''}\n{chunk.get('chunk_text') or ''}",
+            intent,
+        )
+    ]
     if debug_trace is not None:
         debug_trace["filtered_sections"] = [
             {
@@ -232,19 +274,75 @@ def get_top_chunks(
             for chunk in filtered_chunks
         ]
 
-    if not filtered_chunks and not structured_results:
+    fts_chunks = search_medicine_chunks_fts(
+        intent_search_text(intent, query),
+        medicine_ids=matched_ids,
+        chunk_types=None,
+        limit=max(top_k * 3, top_k),
+        database_path=database_path,
+    )
+    fts_results = [
+        _retrieval_result(
+            chunk,
+            similarity=1.0 / (1.0 + index),
+            ranking_score=(20.0 - index) + _source_rank(chunk, intent) * 0.001,
+            retrieval_method="fts5",
+        )
+        for index, chunk in enumerate(fts_chunks)
+        if chunk_supports_intent(
+            str(chunk.get("chunk_type") or ""),
+            f"{chunk.get('section') or ''}\n{chunk.get('chunk_text') or ''}",
+            intent,
+        )
+    ]
+    if debug_trace is not None:
+        debug_trace["fts_match_count"] = len(fts_results)
+
+    section_results = [
+        _retrieval_result(
+            chunk,
+            similarity=1.0,
+            ranking_score=(
+                100.0
+                + _section_rank(chunk, intent) * 10.0
+                + _source_rank(chunk, intent) * 0.001
+            ),
+            retrieval_method="section",
+            retrieval_intent=intent,
+        )
+        for chunk in filtered_chunks
+        if intent != "GENERAL"
+    ]
+    section_results.sort(
+        key=lambda item: float(item.get("ranking_score") or 0.0), reverse=True
+    )
+
+    # In the interactive production path an exact stored section or FTS hit is
+    # already deterministic medicine-scoped evidence. Avoid waking the local
+    # embedding model solely to re-rank evidence that will remain above vector
+    # results. Explicit embedding functions (tests/diagnostics) still exercise
+    # the full hybrid path.
+    if embedding_function is None and (
+        structured_results or section_results or fts_results
+    ):
+        deterministic_results = _merge_results(
+            structured_results,
+            sorted(
+                [*section_results, *fts_results],
+                key=lambda item: float(item.get("ranking_score") or 0.0),
+                reverse=True,
+            ),
+            top_k,
+        )
         if debug_trace is not None:
-            has_queryable_data = (
-                int(data_status["chunks_count"]) > 0
-                and int(data_status["embeddings_count"]) > 0
-            )
-            state = "section_missing" if has_queryable_data else "rag_not_processed"
-            debug_trace["retrieval_state"] = state
-            debug_trace["fallback_reason"] = state
-        return []
+            debug_trace["embedding_skipped_reason"] = "deterministic_evidence_found"
+            debug_trace["top_chunks"] = [dict(item) for item in deterministic_results]
+            debug_trace["retrieval_state"] = "chunks_found"
+        return deterministic_results
 
     candidate_chunks = []
-    for chunk in filtered_chunks:
+    embedding_pool = filtered_chunks
+    for chunk in embedding_pool:
         raw_embedding = chunk.get("embedding")
         if raw_embedding is None:
             continue
@@ -256,14 +354,21 @@ def get_top_chunks(
         candidate_chunks.append(chunk)
 
     if not candidate_chunks:
+        results = _merge_results(
+            structured_results,
+            _merge_results(section_results, fts_results, top_k),
+            top_k,
+        )
         if debug_trace is not None:
-            debug_trace["top_chunks"] = [dict(item) for item in structured_results]
-            if structured_results:
+            debug_trace["top_chunks"] = [dict(item) for item in results]
+            if results:
                 debug_trace["retrieval_state"] = "chunks_found"
             else:
-                debug_trace["retrieval_state"] = "rag_not_processed"
-                debug_trace["fallback_reason"] = "embeddings_missing"
-        return structured_results
+                has_queryable_data = int(data_status["chunks_count"]) > 0
+                state = "section_missing" if has_queryable_data else "rag_not_processed"
+                debug_trace["retrieval_state"] = state
+                debug_trace["fallback_reason"] = state
+        return results
 
     embed = embedding_function or generate_embedding
     query_embedding = _validated_vector(embed(query.strip()), "query embedding")
@@ -282,7 +387,15 @@ def get_top_chunks(
         except ValueError:
             # One corrupt/stale vector must not make all retrieval unavailable.
             continue
-        if similarity < minimum_score:
+        exact_semantic_section = (
+            str(chunk.get("chunk_type") or "") in intent_types
+            and chunk_supports_intent(
+                str(chunk.get("chunk_type") or ""),
+                f"{chunk.get('section') or ''}\n{chunk.get('chunk_text') or ''}",
+                intent,
+            )
+        )
+        if similarity < minimum_score and not exact_semantic_section:
             continue
 
         name_match = _medicine_name_is_explicit(
@@ -298,34 +411,117 @@ def get_top_chunks(
             + section_rank * 10.0
             + source_rank * 0.001
         )
-        result = {
-            "chunk_id": chunk.get("chunk_id"),
-            "medicine_id": chunk.get("medicine_id"),
-            "document_id": chunk.get("document_id"),
-            "medicine_name": chunk.get("medicine_name"),
-            "document_type": chunk.get("document_type"),
-            "chunk_type": chunk.get("chunk_type"),
-            "section": chunk.get("section"),
-            "chunk_text": chunk.get("chunk_text"),
-            "similarity_score": float(similarity),
-            "ranking_score": float(ranking_score),
-            "source_name": chunk.get("source_name"),
-            "source_type": chunk.get("source_type"),
-            "source_url": chunk.get("source_url") or chunk.get("source_reference"),
-            "source_date": chunk.get("source_date") or chunk.get("approval_date"),
-        }
+        result = _retrieval_result(
+            chunk,
+            similarity=similarity,
+            ranking_score=ranking_score,
+            retrieval_method="embedding",
+            retrieval_intent=intent,
+        )
         ranked.append((ranking_score, similarity, result))
 
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
     vector_results = [item[2] for item in ranked]
-    results = _merge_results(structured_results, vector_results, top_k)
+    hybrid_results = sorted(
+        [*section_results, *fts_results, *vector_results],
+        key=lambda item: float(item.get("ranking_score") or 0.0),
+        reverse=True,
+    )
+    results = _merge_results(structured_results, hybrid_results, top_k)
     if debug_trace is not None:
         debug_trace["top_chunks"] = [dict(result) for result in results]
         if results:
             debug_trace["retrieval_state"] = "chunks_found"
         else:
-            debug_trace["retrieval_state"] = "low_similarity"
-            debug_trace["fallback_reason"] = "low_similarity"
+            has_queryable_data = int(data_status["chunks_count"]) > 0
+            state = "section_missing" if has_queryable_data else "rag_not_processed"
+            debug_trace["retrieval_state"] = state
+            debug_trace["fallback_reason"] = state
+    return results
+
+
+def _retrieval_result(
+    chunk: dict[str, Any],
+    *,
+    similarity: float,
+    ranking_score: float,
+    retrieval_method: str,
+    retrieval_intent: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "chunk_id": chunk.get("chunk_id"),
+        "medicine_id": chunk.get("medicine_id"),
+        "document_id": chunk.get("document_id"),
+        "medicine_name": chunk.get("medicine_name"),
+        "document_type": chunk.get("document_type"),
+        "chunk_type": chunk.get("chunk_type"),
+        "section": chunk.get("section"),
+        "chunk_text": chunk.get("chunk_text"),
+        "similarity_score": float(similarity),
+        "ranking_score": float(ranking_score),
+        "retrieval_method": retrieval_method,
+        "retrieval_intent": retrieval_intent,
+        "source_name": chunk.get("source_name"),
+        "source_type": chunk.get("source_type"),
+        "source_url": chunk.get("source_url") or chunk.get("source_reference"),
+        "source_date": chunk.get("source_date") or chunk.get("approval_date"),
+    }
+
+
+_METADATA_FIELDS = {
+    "ACTIVE_INGREDIENT": ("active_ingredient", "active_ingredient"),
+    "INDICATION": ("indications", "indications"),
+    "USAGE": ("usage_information", "usage"),
+    "DOSAGE": ("dosage_information", "dosage"),
+    "FREQUENCY": ("frequency_information", "frequency"),
+    "ROUTE_OF_ADMINISTRATION": ("route_of_administration", "route_of_administration"),
+    "SIDE_EFFECTS": ("common_side_effects", "common_side_effects"),
+    "SERIOUS_SIDE_EFFECTS": ("serious_side_effects", "serious_side_effects"),
+    "WARNING": ("warnings", "warnings"),
+    "CONTRAINDICATION": ("contraindications", "contraindications"),
+    "INTERACTION": ("interactions", "interactions"),
+}
+
+
+def _structured_metadata_results(
+    medicines: Sequence[dict[str, Any]], *, intent: str
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for medicine in medicines:
+        if intent == "WHAT_IS":
+            facts = [
+                f"Ürün adı: {medicine.get('medicine_name')}",
+                f"Etken madde: {medicine.get('active_ingredient')}",
+                f"Firma: {medicine.get('company')}",
+                f"Farmasötik form: {medicine.get('pharmaceutical_form')}",
+                f"Yitilik: {medicine.get('strength')}",
+            ]
+            text = "\n".join(item for item in facts if not item.endswith("None"))
+            chunk_type = "general"
+        else:
+            mapping = _METADATA_FIELDS.get(intent)
+            if mapping is None:
+                continue
+            field, chunk_type = mapping
+            text = str(medicine.get(field) or "").strip()
+        if not text:
+            continue
+        results.append(
+            {
+                "medicine_id": medicine.get("medicine_id"),
+                "medicine_name": medicine.get("medicine_name"),
+                "chunk_type": chunk_type,
+                "chunk_text": text,
+                "similarity_score": 1.0,
+                "ranking_score": 200.0,
+                "retrieval_method": "metadata",
+                "retrieval_intent": intent,
+                "source_name": medicine.get("source_name") or medicine.get("source") or "Yerel ürün kaydı",
+                "source_type": medicine.get("source") or "LOCAL_METADATA",
+                "source_url": medicine.get("source_reference"),
+                "source_date": medicine.get("license_date"),
+            }
+        )
     return results
 
 
@@ -381,7 +577,7 @@ def _source_rank(chunk: dict[str, Any], intent: str) -> int:
     source_type = str(chunk.get("source_type") or "").upper()
     document_type = str(chunk.get("document_type") or "").upper()
     chunk_type = str(chunk.get("chunk_type") or "")
-    if intent in {"DOSAGE", "FREQUENCY"}:
+    if intent in {"DOSAGE", "FREQUENCY", "USAGE"}:
         if source_type == "TITCK" and document_type == "KUB" and chunk_type in {
             "dosage",
             "frequency",
@@ -431,7 +627,7 @@ def _section_rank(chunk: dict[str, Any], intent: str) -> int:
         if "advers etki" in section:
             return 2
         return 1
-    if intent in {"DOSAGE", "FREQUENCY"}:
+    if intent in {"DOSAGE", "FREQUENCY", "USAGE"}:
         if document_type == "KT" and "nasil kullan" in section:
             return 4
         if document_type == "KT" and (
@@ -443,7 +639,7 @@ def _section_rank(chunk: dict[str, Any], intent: str) -> int:
         ):
             return 2
         return 1
-    return 2 if chunk_type in _INTENT_CHUNK_TYPES.get(intent, set()) else 1
+    return 2 if chunk_type in INTENT_CHUNK_TYPES.get(intent, ()) else 1
 
 
 def _merge_results(
@@ -468,32 +664,112 @@ def _merge_results(
     return merged
 
 
-def detect_intent(query: str) -> str:
-    """Detect the retrieval intent without using an LLM."""
+def _processed_candidates(
+    candidates: Sequence[dict[str, Any]],
+    chunks: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return unique candidates that have current, queryable embeddings."""
 
-    normalized = _normalize_for_match(query)
-    compact = normalized.replace(" ", "")
-    if (
-        "yanetki" in compact
-        or "istenmeyenetki" in compact
-        or "adversetki" in compact
-    ):
-        return "SIDE_EFFECTS"
-    for intent, terms in _INTENT_TERMS:
-        if any(_normalize_for_match(term) in normalized for term in terms):
-            return intent
-    query_tokens = normalized.split()
-    for intent, terms in _INTENT_TERMS:
-        for term in terms:
-            normalized_term = _normalize_for_match(term)
-            term_size = len(normalized_term.split())
-            windows = [
-                " ".join(query_tokens[index : index + term_size])
-                for index in range(max(1, len(query_tokens) - term_size + 1))
-            ]
-            if any(fuzz.ratio(window, normalized_term) >= 86 for window in windows):
-                return intent
-    return "GENERAL"
+    queryable_ids = {
+        int(chunk["medicine_id"])
+        for chunk in chunks
+        if chunk.get("medicine_id") is not None
+        and chunk.get("embedding") is not None
+        and (
+            not chunk.get("embedding_model")
+            or chunk.get("embedding_model") == EMBEDDING_MODEL_NAME
+        )
+    }
+    processed: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for candidate in candidates:
+        medicine_id = int(candidate["medicine_id"])
+        if medicine_id in queryable_ids and medicine_id not in seen:
+            seen.add(medicine_id)
+            processed.append(candidate)
+    return processed
+
+
+def _same_commercial_brand_candidates(
+    candidates: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Exclude PLUS/FORTE/DUO sub-brands from an exact base-brand query."""
+
+    if not candidates:
+        return []
+    matched_alias = str(
+        candidates[0].get("matched_alias") or candidates[0].get("alias") or ""
+    )
+    requested_brand = _compact_commercial_brand(matched_alias)
+    if not requested_brand:
+        return list(candidates)
+    exact_brand = [
+        candidate
+        for candidate in candidates
+        if _compact_commercial_brand(str(candidate.get("medicine_name") or ""))
+        == requested_brand
+    ]
+    return exact_brand or list(candidates)
+
+
+def _narrow_candidates_by_explicit_product(
+    query: str, candidates: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Use an explicitly written strength/form to avoid mixing brand variants."""
+
+    normalized_query = normalize_text(query)
+    exact_mentions = [
+        candidate
+        for candidate in candidates
+        if re.search(
+            rf"(?:^|\s){re.escape(normalize_text(str(candidate.get('medicine_name') or '')))}(?:\s|$)",
+            normalized_query,
+        )
+    ]
+    if len(exact_mentions) == 1:
+        return exact_mentions
+
+    query_signature = medicine_signature(query)
+    query_strengths = set(query_signature["strengths"])
+    query_forms = set(query_signature["forms"])
+    compatible: list[dict[str, Any]] = []
+    for candidate in candidates:
+        signature = medicine_signature(str(candidate.get("medicine_name") or ""))
+        candidate_strengths = set(signature["strengths"])
+        candidate_forms = set(signature["forms"])
+        if query_strengths and candidate_strengths != query_strengths:
+            continue
+        if query_forms and candidate_forms and query_forms.isdisjoint(candidate_forms):
+            continue
+        compatible.append(candidate)
+    return compatible or list(candidates)
+
+
+def _compact_commercial_brand(value: str) -> str:
+    prefix: list[str] = []
+    for token in _normalize_for_match(value).split():
+        if any(character.isdigit() for character in token):
+            break
+        if token in _GENERIC_NAME_WORDS:
+            break
+        prefix.append(token)
+    return "".join(prefix)
+
+
+def _suggestion_queries(
+    candidates: Sequence[dict[str, Any]], *, intent: str, limit: int = 5
+) -> list[str]:
+    """Build ready-to-run questions while preserving the original intent."""
+
+    suffix = SUGGESTION_SUFFIXES.get(intent, "hakkında kayıtlı bilgi verir misin?")
+    queries: list[str] = []
+    for candidate in candidates:
+        query = f"{str(candidate['medicine_name']).strip()} {suffix}"
+        if query not in queries:
+            queries.append(query)
+        if len(queries) >= limit:
+            break
+    return queries
 
 
 def _query_has_explicit_medicine_name(query: str) -> bool:
@@ -532,9 +808,7 @@ def _validated_vector(vector: Sequence[float], label: str) -> list[float]:
 
 
 def _normalize_for_match(text: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", text.casefold())
-    without_marks = "".join(char for char in decomposed if not unicodedata.combining(char))
-    return " ".join(re.findall(r"\w+", without_marks, flags=re.UNICODE))
+    return normalize_text(text)
 
 
 def _medicine_name_is_explicit(normalized_query: str, medicine_name: str) -> bool:

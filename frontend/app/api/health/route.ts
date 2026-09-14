@@ -16,10 +16,16 @@ export async function GET() {
     });
     const payload: unknown = await response.json().catch(() => ({}));
     if (!response.ok) {
-      return NextResponse.json({ online: false, medicine_count: 0 }, { status: 503 });
+      return NextResponse.json(
+        { online: false, catalog_medicine_count: 0, ready_medicine_count: 0 },
+        { status: 503 },
+      );
     }
     return NextResponse.json({ online: true, ...(payload as object) });
   } catch {
-    return NextResponse.json({ online: false, medicine_count: 0 }, { status: 503 });
+    return NextResponse.json(
+      { online: false, catalog_medicine_count: 0, ready_medicine_count: 0 },
+      { status: 503 },
+    );
   }
 }

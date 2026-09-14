@@ -1,7 +1,7 @@
 const suggestions = [
-  "Parol günde kaç kez alınır?",
-  "Muscoflex kas gevşetir mi?",
-  "Arveles aç karnına mı içilir?",
+  "PAROL 500 MG TABLET ne için kullanılır?",
+  "MUSCOFLEX 4MG KAPSÜL kas gevşetir mi?",
+  "A-FERİN 300 MG/2 MG/10 MG KAPSÜL nasıl kullanılır?",
 ] as const;
 
 type SuggestedQueriesProps = {
